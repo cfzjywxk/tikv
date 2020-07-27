@@ -31,6 +31,7 @@
 #
 # - `release` - create a release profile, optimized build
 
+
 SHELL := /bin/bash
 ENABLE_FEATURES ?=
 
