@@ -454,6 +454,13 @@ fn process_read_impl<E: Engine>(
             let (kv_pairs, has_remain) = result?;
             tls_collect_keyread_histogram_vec(tag.get_str(), kv_pairs.len() as f64);
 
+            for (key, lock) in kv_pairs.iter() {
+                info!("[for debug] resolve lock read kv pairs";
+                    "key" => &log_wrappers::Value::key(key.as_encoded()),
+                    "lock" => ?lock,
+                );
+            }
+
             if kv_pairs.is_empty() {
                 Ok(ProcessResult::Res)
             } else {
@@ -464,6 +471,9 @@ fn process_read_impl<E: Engine>(
                     // All locks are scanned
                     None
                 };
+                info!("sleep 20s before trigger real resolve");
+                thread::sleep(Duration::from_millis(20000));
+                info!("start to trigger real resolve");
                 Ok(ProcessResult::NextCommand {
                     cmd: ResolveLock::new(
                         mem::replace(txn_status, Default::default()),

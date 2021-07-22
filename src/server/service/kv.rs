@@ -1511,11 +1511,47 @@ txn_command_future!(future_batch_rollback, BatchRollbackRequest, BatchRollbackRe
         resp.set_error(extract_key_error(&e));
     }
 });
-txn_command_future!(future_resolve_lock, ResolveLockRequest, ResolveLockResponse, (v, resp) {
-    if let Err(e) = v {
-        resp.set_error(extract_key_error(&e));
-    }
-});
+
+fn future_resolve_lock<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
+    req: ResolveLockRequest,
+) -> impl Future<Item=ResolveLockResponse, Error=Error> {
+    {}
+    let (cb, f) = paired_future_callback();
+    let req_copy = req.clone();
+    let res = storage.sched_txn_command(req.into(), cb);
+
+    AndThenWith::new(res, f.map_err(Error::from)).map(move |v| {
+        let mut resp = ResolveLockResponse::default();
+        if v.is_ok() {
+            info!("[for debug] resolve lock result v is ok";
+                "start_ts" => req_copy.get_start_version(),
+                "commit_ts" => req_copy.get_commit_version(),
+            );
+        } else if v.is_err() {
+            info!("[for debug] resolve lock result v is error";
+                "start_ts" => req_copy.get_start_version(),
+                "commit_ts" => req_copy.get_commit_version()
+            );
+            if let Err(e) = v.as_ref() {
+                info!("[for debug] resolve lock result v is error";
+                "start_ts" => req_copy.get_start_version(),
+                "commit_ts" => req_copy.get_commit_version(),
+                "error" => ?e);
+            }
+        }
+        if let Some(err) = extract_region_error(&v) {
+            resp.set_region_error(err);
+        } else {
+            if let Err(e) = v.as_ref() {
+                info!("[for debug] resolve lock result v is error, set resp error";);
+                resp.set_error(extract_key_error(&e));
+            }
+        }
+        resp
+    })
+}
+
 txn_command_future!(future_commit, CommitRequest, CommitResponse, (v, resp) {
     match v {
         Ok(TxnStatus::Committed { commit_ts }) => {
