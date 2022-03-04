@@ -83,8 +83,8 @@ futures = { version = "0.3", features = ["thread-pool", "compat"] }
 futures-executor = "0.3.1"
 futures-timer = "3.0"
 futures-util = { version = "0.3.1", default-features = false, features = ["io", "async-await"] }
-grpcio = { version = "0.9",  default-features = false, features = ["openssl-vendored", "protobuf-codec"] }
-grpcio-health = { version = "0.9", default-features = false, features = ["protobuf-codec"] }
+grpcio = { version = "0.10.0",  default-features = false, features = ["openssl-vendored", "protobuf-codec"] }
+grpcio-health = { version = "0.10.0", default-features = false, features = ["protobuf-codec"] }
 hex = "0.4"
 hyper-tls = "0.5"
 itertools = "0.10"
