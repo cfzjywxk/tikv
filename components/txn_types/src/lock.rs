@@ -363,6 +363,29 @@ impl Lock {
         )))
     }
 
+    // Check if lock could be bypassed for isolation level with `RcCheckTs`.
+    pub fn check_ts_conflict_rc_read(
+        lock: Cow<'_, Self>,
+        key: &Key,
+        bypass_locks: &TsSet,
+    ) -> Result<()> {
+        if lock.lock_type == LockType::Lock || lock.lock_type == LockType::Pessimistic {
+            // Ignore lock when the lock's type is Lock or Pessimistic.
+            return Ok(());
+        }
+
+        // The transaction is already rolled back.
+        if bypass_locks.contains(lock.ts) {
+            return Ok(());
+        }
+
+        // Return lock error.
+        let raw_key = key.to_raw()?;
+        Err(Error::from(ErrorInner::KeyIsLocked(
+            lock.into_owned().into_lock_info(raw_key),
+        )))
+    }
+
     pub fn is_pessimistic_txn(&self) -> bool {
         !self.for_update_ts.is_zero()
     }

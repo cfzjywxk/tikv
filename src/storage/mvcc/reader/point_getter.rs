@@ -8,6 +8,7 @@ use std::borrow::Cow;
 use txn_types::{Key, Lock, LockType, TimeStamp, TsSet, Value, WriteRef, WriteType};
 
 use crate::storage::kv::{Cursor, CursorBuilder, ScanMode, Snapshot, Statistics};
+use crate::storage::mvcc::ErrorInner::WriteConflict;
 use crate::storage::mvcc::{default_not_found_error, NewerTsCheckState, Result};
 
 /// `PointGetter` factory.
@@ -133,7 +134,9 @@ impl<S: Snapshot> PointGetterBuilder<S> {
             ts: self.ts,
             bypass_locks: self.bypass_locks,
             access_locks: self.access_locks,
-            met_newer_ts_data: if self.check_has_newer_ts_data {
+            met_newer_ts_data: if self.check_has_newer_ts_data
+                || self.isolation_level == IsolationLevel::RcCheckTs
+            {
                 NewerTsCheckState::NotMetYet
             } else {
                 NewerTsCheckState::Unknown
@@ -200,7 +203,7 @@ impl<S: Snapshot> PointGetter<S> {
         }
 
         match self.isolation_level {
-            IsolationLevel::Si => {
+            IsolationLevel::Si | IsolationLevel::RcCheckTs => {
                 // Check for locks that signal concurrent writes in Si.
                 if let Some(lock) = self.load_and_check_lock(user_key)? {
                     return self.load_data_from_lock(user_key, lock);
@@ -225,19 +228,41 @@ impl<S: Snapshot> PointGetter<S> {
 
         if let Some(ref lock_value) = lock_value {
             let lock = Lock::parse(lock_value)?;
-            if self.met_newer_ts_data == NewerTsCheckState::NotMetYet {
-                self.met_newer_ts_data = NewerTsCheckState::Met;
-            }
-            if let Err(e) =
-                Lock::check_ts_conflict(Cow::Borrowed(&lock), user_key, self.ts, &self.bypass_locks)
-            {
-                self.statistics.lock.processed_keys += 1;
-                if self.access_locks.contains(lock.ts) {
-                    return Ok(Some(lock));
+            match self.isolation_level {
+                IsolationLevel::Si => {
+                    if self.met_newer_ts_data == NewerTsCheckState::NotMetYet {
+                        self.met_newer_ts_data = NewerTsCheckState::Met;
+                    }
+                    if let Err(e) = Lock::check_ts_conflict(
+                        Cow::Borrowed(&lock),
+                        user_key,
+                        self.ts,
+                        &self.bypass_locks,
+                    ) {
+                        self.statistics.lock.processed_keys += 1;
+                        if self.access_locks.contains(lock.ts) {
+                            return Ok(Some(lock));
+                        }
+                        Err(e.into())
+                    } else {
+                        Ok(None)
+                    }
                 }
-                Err(e.into())
-            } else {
-                Ok(None)
+                IsolationLevel::RcCheckTs => {
+                    if let Err(e) = Lock::check_ts_conflict_rc_read(
+                        Cow::Borrowed(&lock),
+                        user_key,
+                        &self.bypass_locks,
+                    ) {
+                        self.statistics.lock.processed_keys += 1;
+                        Err(e.into())
+                    } else {
+                        Ok(None)
+                    }
+                }
+                _ => {
+                    unreachable!()
+                }
             }
         } else {
             Ok(None)
@@ -265,8 +290,19 @@ impl<S: Snapshot> PointGetter<S> {
 
             let cursor_key = self.write_cursor.key(&mut self.statistics.write);
             // No need to compare user key because it uses prefix seek.
-            if Key::decode_ts_from(cursor_key)? > self.ts {
+            let key_commit_ts = Key::decode_ts_from(cursor_key)?;
+            if key_commit_ts > self.ts {
                 self.met_newer_ts_data = NewerTsCheckState::Met;
+                if self.isolation_level == IsolationLevel::RcCheckTs {
+                    return Err(WriteConflict {
+                        start_ts: self.ts,
+                        conflict_start_ts: Default::default(),
+                        conflict_commit_ts: key_commit_ts,
+                        key: cursor_key.into(),
+                        primary: vec![],
+                    }
+                    .into());
+                }
             }
         }
 
@@ -411,17 +447,33 @@ mod tests {
     use kvproto::kvrpcpb::{Assertion, AssertionLevel};
 
     fn new_multi_point_getter<E: Engine>(engine: &E, ts: TimeStamp) -> PointGetter<E::Snap> {
+        new_multi_point_getter_with_iso(engine, ts, IsolationLevel::Si)
+    }
+
+    fn new_multi_point_getter_with_iso<E: Engine>(
+        engine: &E,
+        ts: TimeStamp,
+        iso_level: IsolationLevel,
+    ) -> PointGetter<E::Snap> {
         let snapshot = engine.snapshot(Default::default()).unwrap();
         PointGetterBuilder::new(snapshot, ts)
-            .isolation_level(IsolationLevel::Si)
+            .isolation_level(iso_level)
             .build()
             .unwrap()
     }
 
     fn new_single_point_getter<E: Engine>(engine: &E, ts: TimeStamp) -> PointGetter<E::Snap> {
+        new_single_point_getter_with_iso(engine, ts, IsolationLevel::Si)
+    }
+
+    fn new_single_point_getter_with_iso<E: Engine>(
+        engine: &E,
+        ts: TimeStamp,
+        iso_level: IsolationLevel,
+    ) -> PointGetter<E::Snap> {
         let snapshot = engine.snapshot(Default::default()).unwrap();
         PointGetterBuilder::new(snapshot, ts)
-            .isolation_level(IsolationLevel::Si)
+            .isolation_level(iso_level)
             .multi(false)
             .build()
             .unwrap()
@@ -1230,5 +1282,55 @@ mod tests {
             let value = multi_getter.get(&Key::from_raw(*k)).unwrap();
             assert_eq!(value, v.map(|v| v.to_vec()));
         }
+    }
+
+    #[test]
+    fn test_point_get_check_rc_ts() {
+        let engine = TestEngineBuilder::new().build().unwrap();
+
+        let (key0, val0) = (b"k0", b"v0");
+        must_prewrite_put(&engine, key0, val0, key0, 1);
+        must_commit(&engine, key0, 1, 5);
+
+        let (key1, val1) = (b"k1", b"v1");
+        must_prewrite_put(&engine, key1, val1, key1, 10);
+        must_commit(&engine, key1, 10, 20);
+
+        let (key2, val2) = (b"k2", b"v2");
+        must_prewrite_put(&engine, key2, val2, key2, 30);
+        must_commit(&engine, key2, 30, 40);
+
+        let (key3, val3) = (b"k3", b"v3");
+        must_prewrite_put(&engine, key3, val3, key3, 50);
+
+        // No more recent version.
+        let mut getter_with_ts_ok =
+            new_single_point_getter_with_iso(&engine, 25.into(), IsolationLevel::RcCheckTs);
+        must_get_value(&mut getter_with_ts_ok, key1, val1);
+
+        // The read_ts is stale error should be reported.
+        let mut getter_not_ok =
+            new_single_point_getter_with_iso(&engine, 35.into(), IsolationLevel::RcCheckTs);
+        must_get_err(&mut getter_not_ok, key2);
+
+        // Though lock.ts > read_ts error should still be reported.
+        let mut getter_not_ok =
+            new_single_point_getter_with_iso(&engine, 45.into(), IsolationLevel::RcCheckTs);
+        must_get_err(&mut getter_not_ok, key3);
+
+        // Test batch point get. Report error if more recent version is met.
+        let mut batch_getter =
+            new_multi_point_getter_with_iso(&engine, 35.into(), IsolationLevel::RcCheckTs);
+        must_get_value(&mut batch_getter, key0, val0);
+        must_get_value(&mut batch_getter, key1, val1);
+        must_get_err(&mut batch_getter, key2);
+
+        // Test batch point get. Report error if lock is met though lock.ts > read_ts.
+        let mut batch_getter =
+            new_multi_point_getter_with_iso(&engine, 45.into(), IsolationLevel::RcCheckTs);
+        must_get_value(&mut batch_getter, key0, val0);
+        must_get_value(&mut batch_getter, key1, val1);
+        must_get_value(&mut batch_getter, key2, val2);
+        must_get_err(&mut batch_getter, key3);
     }
 }

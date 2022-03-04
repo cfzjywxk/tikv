@@ -9,6 +9,7 @@ use txn_types::{Key, Lock, LockType, OldValue, TimeStamp, Value, WriteRef, Write
 
 use super::ScannerConfig;
 use crate::storage::kv::SEEK_BOUND;
+use crate::storage::mvcc::ErrorInner::WriteConflict;
 use crate::storage::mvcc::{NewerTsCheckState, Result};
 use crate::storage::txn::{Result as TxnResult, TxnEntry, TxnEntryScanner};
 use crate::storage::{Cursor, Snapshot, Statistics};
@@ -137,7 +138,9 @@ impl<S: Snapshot, P: ScanPolicy<S>> ForwardScanner<S, P> {
             default: default_cursor,
         };
         ForwardScanner {
-            met_newer_ts_data: if cfg.check_has_newer_ts_data {
+            met_newer_ts_data: if cfg.check_has_newer_ts_data
+                || cfg.isolation_level == IsolationLevel::RcCheckTs
+            {
                 NewerTsCheckState::NotMetYet
             } else {
                 NewerTsCheckState::Unknown
@@ -265,7 +268,9 @@ impl<S: Snapshot, P: ScanPolicy<S>> ForwardScanner<S, P> {
             };
 
             if has_lock {
-                if self.met_newer_ts_data == NewerTsCheckState::NotMetYet {
+                if self.met_newer_ts_data == NewerTsCheckState::NotMetYet
+                    && self.cfg.isolation_level == IsolationLevel::Si
+                {
                     self.met_newer_ts_data = NewerTsCheckState::Met;
                 }
                 current_user_key = match self.scan_policy.handle_lock(
@@ -328,12 +333,25 @@ impl<S: Snapshot, P: ScanPolicy<S>> ForwardScanner<S, P> {
                     // Meet another key.
                     return Ok(false);
                 }
-                if Key::decode_ts_from(current_key)? <= self.cfg.ts {
+                let key_commit_ts = Key::decode_ts_from(current_key)?;
+                if key_commit_ts <= self.cfg.ts {
                     // Founded, don't need to seek again.
                     needs_seek = false;
                     break;
                 } else if self.met_newer_ts_data == NewerTsCheckState::NotMetYet {
                     self.met_newer_ts_data = NewerTsCheckState::Met;
+                }
+
+                // Report error if there's a more recent version if the isolation level is RcCheckTs.
+                if self.cfg.isolation_level == IsolationLevel::RcCheckTs {
+                    return Err(WriteConflict {
+                        start_ts: self.cfg.ts,
+                        conflict_start_ts: Default::default(),
+                        conflict_commit_ts: key_commit_ts,
+                        key: current_key.into(),
+                        primary: vec![],
+                    }
+                    .into());
                 }
             }
         }
@@ -612,13 +630,21 @@ fn scan_latest_handle_lock<S: Snapshot, T>(
     };
     lock_cursor.next(&mut statistics.lock);
 
-    Lock::check_ts_conflict(
-        Cow::Owned(lock),
-        &current_user_key,
-        cfg.ts,
-        &cfg.bypass_locks,
-    )
-    .or_else(|e| {
+    let res = match cfg.isolation_level {
+        IsolationLevel::Si => Lock::check_ts_conflict(
+            Cow::Owned(lock),
+            &current_user_key,
+            cfg.ts,
+            &cfg.bypass_locks,
+        ),
+        IsolationLevel::RcCheckTs => {
+            Lock::check_ts_conflict_rc_read(Cow::Owned(lock), &current_user_key, &cfg.bypass_locks)
+        }
+        _ => {
+            unreachable!()
+        }
+    };
+    res.or_else(|e| {
         // Even if there is a lock error, we still need to step the cursor for future
         // calls.
         statistics.lock.processed_keys += 1;
@@ -1466,6 +1492,65 @@ mod latest_kv_tests {
             .map(|result| result.unwrap())
             .collect();
         assert_eq!(result, expected_result);
+    }
+
+    #[test]
+    fn test_rc_read_check_ts() {
+        let engine = TestEngineBuilder::new().build().unwrap();
+
+        let (key0, val0) = (b"k0", b"v0");
+        must_prewrite_put(&engine, key0, val0, key0, 1);
+        must_commit(&engine, key0, 1, 5);
+
+        let (key1, val1) = (b"k1", b"v1");
+        must_prewrite_put(&engine, key1, val1, key1, 10);
+        must_commit(&engine, key1, 10, 20);
+
+        let (key2, val2) = (b"k2", b"v2");
+        must_prewrite_put(&engine, key2, val2, key2, 30);
+        must_commit(&engine, key2, 30, 40);
+
+        let (key3, val3) = (b"k3", b"v3");
+        must_prewrite_put(&engine, key3, val3, key3, 50);
+
+        let snapshot = engine.snapshot(Default::default()).unwrap();
+        let mut scanner = ScannerBuilder::new(snapshot, 35.into())
+            .range(None, None)
+            .isolation_level(IsolationLevel::RcCheckTs)
+            .build()
+            .unwrap();
+
+        // Scanner has met a more recent version.
+        assert_eq!(
+            scanner.next().unwrap(),
+            Some((Key::from_raw(key0), val0.to_vec()))
+        );
+        assert_eq!(
+            scanner.next().unwrap(),
+            Some((Key::from_raw(key1), val1.to_vec()))
+        );
+        assert!(scanner.next().is_err());
+
+        // Scanner has met a lock though lock.ts > read_ts.
+        let snapshot = engine.snapshot(Default::default()).unwrap();
+        let mut scanner = ScannerBuilder::new(snapshot, 55.into())
+            .range(None, None)
+            .isolation_level(IsolationLevel::RcCheckTs)
+            .build()
+            .unwrap();
+        assert_eq!(
+            scanner.next().unwrap(),
+            Some((Key::from_raw(key0), val0.to_vec()))
+        );
+        assert_eq!(
+            scanner.next().unwrap(),
+            Some((Key::from_raw(key1), val1.to_vec()))
+        );
+        assert_eq!(
+            scanner.next().unwrap(),
+            Some((Key::from_raw(key2), val2.to_vec()))
+        );
+        assert!(scanner.next().is_err());
     }
 }
 
