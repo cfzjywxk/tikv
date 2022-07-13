@@ -979,6 +979,11 @@ where
                 );
             }
 
+            info!(
+                "[for debug] handle_raft_committed_entries in apply";
+                "entry" => ?entry,
+            );
+
             // NOTE: before v5.0, `EntryType::EntryConfChangeV2` entry is handled by `unimplemented!()`,
             // which can break compatibility (i.e. old version tikv running on data written by new version tikv),
             // but PD will reject old version tikv join the cluster, so this should not happen.
@@ -1259,8 +1264,8 @@ where
                 // clear dirty values.
                 ctx.kv_wb_mut().rollback_to_save_point().unwrap();
                 match e {
-                    Error::EpochNotMatch(..) => debug!(
-                        "epoch not match";
+                    Error::EpochNotMatch(..) => info!(
+                        "[for debug] apply epoch not match";
                         "region_id" => self.region_id(),
                         "peer_id" => self.id(),
                         "err" => ?e
@@ -1450,6 +1455,13 @@ where
             }
         );
 
+        fail_point!("exec_write_cmd");
+
+
+        info!(
+            "[for debug] exec_write_cmd";
+            "req" => ?req,
+        );
         let requests = req.get_requests();
 
         let mut ranges = vec![];

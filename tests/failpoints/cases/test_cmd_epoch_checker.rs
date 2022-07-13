@@ -36,6 +36,7 @@ impl CbReceivers {
     // When fails to propose, only applied callback will be invoked.
     fn assert_err(&self) {
         let resp = self.applied.recv_timeout(Duration::from_secs(1)).unwrap();
+        info!("assert_err, resp={:?}", resp);
         assert!(resp.get_header().has_error(), "{:?}", resp);
         self.proposed.try_recv().unwrap_err();
         self.committed.try_recv().unwrap_err();
@@ -88,12 +89,17 @@ fn make_write_req(cluster: &mut Cluster<NodeCluster>, k: &[u8]) -> RaftCmdReques
 
 #[test]
 fn test_reject_proposal_during_region_split() {
+    test_util::init_log_for_test();
+    info!(">>>>>> test_reject_proposal_during_region_split");
     let mut cluster = new_node_cluster(0, 3);
     let pd_client = cluster.pd_client.clone();
     pd_client.disable_default_operator();
     cluster.run();
-    cluster.must_transfer_leader(1, new_peer(1, 1));
+    cluster.must_transfer_leader(1, new_peer(2, 2));
     cluster.must_put(b"k", b"v");
+    fail::cfg("exec_write_cmd", "pause").unwrap();
+    info!("[for debug] pause the on_apply_write_cmd");
+    cluster.must_transfer_leader(1, new_peer(1, 1));
 
     // Pause on applying so that region split is not finished.
     let fp = "apply_before_split";
@@ -116,7 +122,7 @@ fn test_reject_proposal_during_region_split() {
     for i in 0..2 {
         if i == 1 {
             // Test another path of calling proposed callback.
-            fail::cfg(propose_batch_raft_command_fp, "2*return").unwrap();
+            // fail::cfg(propose_batch_raft_command_fp, "2*return").unwrap();
         }
         let write_req = make_write_req(&mut cluster, b"k1");
         let (cb, cb_receivers) = make_cb(&write_req);
@@ -130,6 +136,8 @@ fn test_reject_proposal_during_region_split() {
         receivers.push(cb_receivers);
     }
 
+    info!("[for debug] now remove the failpoint apply_before_split"; "receiver len" => receivers.len());
+    fail::remove("exec_write_cmd");
     fail::remove(fp);
     // Split is finished.
     assert!(

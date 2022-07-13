@@ -385,6 +385,14 @@ impl<S: Snapshot> CmdEpochChecker<S> {
         self.maybe_update_term(term);
         while !self.proposed_admin_cmd.is_empty() {
             let cmd = self.proposed_admin_cmd.front_mut().unwrap();
+            info!(
+                      "[for debug] advance_apply";
+                        "cmd" => ?cmd.cmd_type,
+                        "cmd.index" => cmd.index,
+                        "index" => index,
+                        "region" => ?region,
+                        "cmd.cbs" => cmd.cbs.len(),
+                    );
             if cmd.index <= index {
                 for cb in cmd.cbs.drain(..) {
                     let mut resp = cmd_resp::new_error(Error::EpochNotMatch(
@@ -395,6 +403,13 @@ impl<S: Snapshot> CmdEpochChecker<S> {
                         ),
                         vec![region.to_owned()],
                     ));
+                    info!(
+                      "[for debug] advance_apply epoch not match";
+                        "cmd" => ?cmd.cmd_type,
+                        "cmd.index" => cmd.index,
+                        "index" => index,
+                        "region" => ?region,
+                    );
                     cmd_resp::bind_term(&mut resp, term);
                     cb.invoke_with_response(resp);
                 }
@@ -2787,6 +2802,10 @@ where
                 // Compact all cached entries instead of half evict.
                 self.mut_store().evict_cache(false);
             }
+            info!("[for debug] schedule apply task";
+                "region_id" => self.region_id,
+                "entries" => apply.entries.len(),
+            );
             ctx.apply_router
                 .schedule_task(self.region_id, ApplyTask::apply(apply));
         }
@@ -3314,6 +3333,7 @@ where
         mut err_resp: RaftCmdResponse,
         disk_full_opt: DiskFullOpt,
     ) -> bool {
+        let cloned_req = req.clone();
         if self.pending_remove {
             return false;
         }
@@ -3401,6 +3421,10 @@ where
             }
             Ok(Either::Right(idx)) => {
                 if !cb.is_none() {
+                    info!("[for debug] attach_to_conflict_cmd";
+                        "idx" => idx,
+                        "this cmd" => ?cloned_req,
+                    );
                     self.cmd_epoch_checker.attach_to_conflict_cmd(idx, cb);
                 }
                 self.post_propose_fail(req_admin_cmd_type);

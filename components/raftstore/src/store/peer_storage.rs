@@ -1375,6 +1375,12 @@ where
 
         self.cache.append(&self.tag, &entries);
 
+        for ent in entries.iter() {
+            info!("[for debug] append entry";
+                "entry" => ?ent,
+            );
+        }
+
         task.entries = entries;
         // Delete any previously appended log entries which never committed.
         task.cut_logs = Some((last_index + 1, prev_last_index + 1));

@@ -427,6 +427,9 @@ pub fn make_cb(cmd: &RaftCmdRequest) -> (Callback<RocksSnapshot>, mpsc::Receiver
         }))
     } else {
         Callback::write(Box::new(move |resp: WriteResponse| {
+            info!("[for debug] callback is called with response";
+                "resp" => ?&resp,
+            );
             detector.called = true;
             // we don't care error actually.
             let _ = tx.send(resp.response);

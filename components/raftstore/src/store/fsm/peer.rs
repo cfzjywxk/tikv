@@ -2087,8 +2087,8 @@ where
         fail_point!("on_apply_res", |_| {});
         match res {
             ApplyTaskRes::Apply(mut res) => {
-                debug!(
-                    "async apply finish";
+                info!(
+                    "[for debug] on_apply_res:  async apply finish";
                     "region_id" => self.region_id(),
                     "peer_id" => self.fsm.peer_id(),
                     "res" => ?res,
