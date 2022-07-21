@@ -380,6 +380,7 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
         }
 
         if batch.is_empty() {
+            APPLY_POLL_PAUSE_COUNT_VEC.
             self.handler.pause();
             if let Ok(fsm) = self.fsm_receiver.recv() {
                 return batch.push(fsm);

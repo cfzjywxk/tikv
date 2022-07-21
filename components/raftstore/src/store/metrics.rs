@@ -446,6 +446,34 @@ lazy_static! {
             exponential_buckets(0.0005, 2.0, 20).unwrap()
         ).unwrap();
 
+    pub static ref APPLY_TASK_WAIT_TASK_SCHEDULE_TIME_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_apply_wait_task_schedule_time_duration_secs",
+            "Bucketed histogram of apply task wait task schedule time duration.",
+            exponential_buckets(0.0001, 2.0, 20).unwrap()
+        ).unwrap();
+
+    pub static ref APPLY_TASK_WAIT_MSG_POP: Histogram =
+        register_histogram!(
+            "tikv_raftstore_apply_wait_msg_pop_time_duration_secs",
+            "Bucketed histogram of apply task wait task schedule time duration.",
+            exponential_buckets(0.0001, 2.0, 20).unwrap()
+        ).unwrap();
+
+    pub static ref APPLY_FSM_MSG_QUEUE_LEN_GAUGE_VEC: IntGaugeVec =
+        register_int_gauge_vec!(
+            "tikv_raftstore_apply_fsm_queue_len",
+            "length of fsm msg queue",
+            &["type"]
+        ).unwrap();
+
+    pub static ref APPLY_POLL_PAUSE_COUNT_VEC: IntCounterVec =
+        register_int_counter!(
+            "tikv_raftstore_apply_poll_pause_count",
+            "length of fsm msg queue",
+            &["name"]
+        ).unwrap();
+
     pub static ref STORE_RAFT_READY_COUNTER_VEC: IntCounterVec =
         register_int_counter_vec!(
             "tikv_raftstore_raft_ready_handled_total",

@@ -418,6 +418,7 @@ pub struct RaftMetrics {
     pub wf_commit_log: LocalHistogram,
     pub wf_commit_not_persist_log: LocalHistogram,
     pub raft_log_gc_skipped: RaftLogGcSkippedMetrics,
+    pub apply_schedule_task: LocalHistogram,
 }
 
 impl RaftMetrics {
@@ -443,6 +444,7 @@ impl RaftMetrics {
             wf_commit_log: STORE_WF_COMMIT_LOG_DURATION_HISTOGRAM.local(),
             wf_commit_not_persist_log: STORE_WF_COMMIT_NOT_PERSIST_LOG_DURATION_HISTOGRAM.local(),
             raft_log_gc_skipped: RaftLogGcSkippedMetrics::default(),
+            apply_schedule_task: APPLY_TASK_WAIT_TASK_SCHEDULE_TIME_HISTOGRAM.local(),
         }
     }
 

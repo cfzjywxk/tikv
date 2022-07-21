@@ -2780,8 +2780,13 @@ where
                 // Compact all cached entries instead of half evict.
                 self.mut_store().evict_cache(false);
             }
+            let schedule_start = Instant::now();
             ctx.apply_router
                 .schedule_task(self.region_id, ApplyTask::apply(apply));
+            let now = Instant::now();
+            ctx.raft_metrics
+                .apply_schedule_task
+                .observe(now.saturating_duration_since(schedule_start).as_secs_f64());
         }
         fail_point!("after_send_to_apply_1003", self.peer_id() == 1003, |_| {});
     }

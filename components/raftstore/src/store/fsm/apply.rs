@@ -3909,9 +3909,18 @@ where
             normal.delegate.id() == 1003,
             |_| { HandleResult::KeepProcessing }
         );
+        let name = format!("[region {}] {}", normal.delegate.region.get_id(), normal.delegate.id);
+        APPLY_FSM_MSG_QUEUE_LEN_GAUGE_VEC
+            .with_label_values(&[name.as_str()])
+            .set(normal.receiver.len() as i64);
         while self.msg_buf.len() < self.messages_per_tick {
             match normal.receiver.try_recv() {
-                Ok(msg) => self.msg_buf.push(msg),
+                Ok(msg) => {
+                    if let Msg::Apply { start, apply } = &msg {
+                        APPLY_TASK_WAIT_MSG_POP.observe(start.saturating_elapsed().as_secs_f64())
+                    }
+                    self.msg_buf.push(msg);
+                }
                 Err(TryRecvError::Empty) => {
                     handle_result = HandleResult::stop_at(0, false);
                     break;
