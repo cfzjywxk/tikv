@@ -397,6 +397,10 @@ where
             *event = *event + e;
         }
     }
+
+    pub fn is_sharded_region(&self) -> bool {
+        self.peer.is_sharded_region()
+    }
 }
 
 impl<E> BatchRaftCmdRequestBuilder<E>
@@ -5206,6 +5210,13 @@ where
     }
 
     fn register_split_region_check_tick(&mut self) {
+        if self.fsm.is_sharded_region() {
+            info!("[for debug]skip register skip the split region check tick";
+                "region_id" => self.region_id(),
+                "peer_id" => self.fsm.peer_id(),
+            );
+            return;
+        }
         self.schedule_tick(PeerTick::SplitRegionCheck)
     }
 
@@ -5217,6 +5228,13 @@ where
 
     fn on_split_region_check_tick(&mut self) {
         if !self.fsm.peer.is_leader() {
+            return;
+        }
+        if self.fsm.is_sharded_region() {
+            info!("[for debug] on tick skip the split region check tick handle";
+                "region_id" => self.region_id(),
+                "peer_id" => self.fsm.peer_id(),
+            );
             return;
         }
 

@@ -50,6 +50,7 @@ use raftstore::{
 use rand::RngCore;
 use server::server::ConfiguredRaftEngine;
 use tempfile::TempDir;
+use tidb_query_datatype::codec::table::encode_table_shard_row_key;
 use tikv::{config::*, server::KvEngineFactoryBuilder, storage::point_key_range};
 use tikv_util::{config::*, escape, time::ThreadReadId, worker::LazyWorker, HandyRwLock};
 use txn_types::Key;
@@ -785,12 +786,48 @@ pub fn put_till_size<T: Simulator>(
     put_cf_till_size(cluster, CF_DEFAULT, limit, range)
 }
 
+pub fn put_cf_till_size_sharding_key<T: Simulator>(
+    cluster: &mut Cluster<T>,
+    limit: u64,
+    range: &mut dyn Iterator<Item = u64>,
+) -> Vec<u8>
+{
+    let sharded_key = Key::from_raw(&encode_table_shard_row_key(10, 0, b"2")).into_encoded();
+    put_cf_till_size_impl(
+        cluster,
+        CF_DEFAULT,
+        limit,
+        range,
+        &sharded_key,
+        |key: &[u8]| -> Vec<u8> {
+            Key::from_raw(&encode_table_shard_row_key(10, 0, key)).into_encoded()
+        },
+    )
+}
+
 pub fn put_cf_till_size<T: Simulator>(
     cluster: &mut Cluster<T>,
     cf: &'static str,
     limit: u64,
     range: &mut dyn Iterator<Item = u64>,
-) -> Vec<u8> {
+) -> Vec<u8>
+{
+    put_cf_till_size_impl(cluster, cf, limit, range, b"", |key: &[u8]| -> Vec<u8> {
+        key.to_vec()
+    })
+}
+
+pub fn put_cf_till_size_impl<T: Simulator, F>(
+    cluster: &mut Cluster<T>,
+    cf: &'static str,
+    limit: u64,
+    range: &mut dyn Iterator<Item = u64>,
+    dest_key: &[u8],
+    key_encoder: F,
+) -> Vec<u8>
+where
+    F: Fn(&[u8]) -> Vec<u8>,
+{
     assert!(limit > 0);
     let mut len = 0;
     let mut rng = rand::thread_rng();
@@ -807,9 +844,14 @@ pub fn put_cf_till_size<T: Simulator>(
             // plus 1 for the extra encoding prefix
             len += key.len() as u64 + 1;
             len += value.len() as u64;
-            reqs.push(new_put_cf_cmd(cf, key.as_bytes(), &value));
+            let encoded_key = key_encoder(key.as_bytes());
+            reqs.push(new_put_cf_cmd(cf, &encoded_key, &value));
         }
-        cluster.batch_put(key.as_bytes(), reqs).unwrap();
+        if dest_key.len() > 0 {
+            cluster.batch_put(dest_key, reqs).unwrap();
+        } else {
+            cluster.batch_put(key.as_bytes(), reqs).unwrap();
+        }
         // Approximate size of memtable is inaccurate for small data,
         // we flush it to SST so we can use the size properties instead.
         cluster.must_flush_cf(cf, true);

@@ -26,8 +26,10 @@ use raft::{
     INVALID_INDEX,
 };
 use raft_proto::ConfChangeI;
+use tidb_query_datatype::codec::table::check_sharding_key;
 use tikv_util::{box_err, debug, info, time::monotonic_raw_now, Either};
 use time::{Duration, Timespec};
+use txn_types::Key;
 
 use super::peer_storage;
 use crate::{Error, Result};
@@ -103,6 +105,15 @@ pub fn check_key_in_region(key: &[u8], region: &metapb::Region) -> Result<()> {
     } else {
         Err(Error::KeyNotInRegion(key.to_vec(), region.clone()))
     }
+}
+
+/// Check if the region is a sharded region. If the raw start key is greater
+/// than t[table_id]_s, it's a sharded region.
+pub fn check_is_sharded_region(region: &metapb::Region) -> bool {
+    if let Ok(raw_start_key) = Key::from_encoded(region.get_start_key().to_vec()).into_raw() {
+        return check_sharding_key(&raw_start_key).is_ok();
+    }
+    false
 }
 
 /// `is_first_vote_msg` checks `msg` is the first vote (or prevote) message or

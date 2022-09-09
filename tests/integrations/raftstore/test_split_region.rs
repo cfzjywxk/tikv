@@ -10,13 +10,16 @@ use std::{
 use engine_traits::{Iterable, Peekable, CF_DEFAULT, CF_WRITE};
 use keys::data_key;
 use kvproto::{metapb, pdpb, raft_cmdpb::*, raft_serverpb::RaftMessage};
+use log_wrappers::hex;
 use pd_client::PdClient;
 use raft::eraftpb::MessageType;
 use raftstore::{
-    store::{Bucket, BucketRange, Callback, WriteResponse},
+    store::{util::check_is_sharded_region, Bucket, BucketRange, Callback, WriteResponse},
     Result,
 };
 use test_raftstore::*;
+use test_util::init_log_for_test;
+use tidb_query_datatype::codec::table::*;
 use tikv::storage::{kv::SnapshotExt, Snapshot};
 use tikv_util::config::*;
 use txn_types::{Key, PessimisticLock};
@@ -86,6 +89,22 @@ where
             resp
         );
     }
+}
+
+#[test]
+fn test_split_sharded_regions() {
+    init_log_for_test();
+    let count = 3;
+    let mut cluster = new_server_cluster(0, count);
+    cluster.run();
+
+    let pd_client = Arc::clone(&cluster.pd_client);
+    let k1 = Key::from_raw(b"k1").into_encoded();
+
+    let region = pd_client.get_region(k1.as_slice()).unwrap();
+    info!("region info";
+        "region" => ?&region,
+    );
 }
 
 #[test]
@@ -607,6 +626,119 @@ fn test_server_split_region_diff_check() {
     let count = 1;
     let mut cluster = new_server_cluster(0, count);
     test_split_region_diff_check(&mut cluster);
+}
+
+#[test]
+fn test_sharded_region_no_auto_split() {
+    init_log_for_test();
+    let count = 1;
+    let mut cluster = new_server_cluster(0, count);
+    let region_max_size = 2000;
+    let region_split_size = 1000;
+    cluster.cfg.raft_store.split_region_check_tick_interval = ReadableDuration::millis(100);
+    cluster.cfg.raft_store.region_split_check_diff = Some(ReadableSize(10));
+    cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::secs(20);
+    cluster.cfg.coprocessor.region_max_size = Some(ReadableSize(region_max_size));
+    cluster.cfg.coprocessor.region_split_size = ReadableSize(region_split_size);
+    cluster.run();
+    let pd_client = Arc::clone(&cluster.pd_client);
+
+    let region = cluster.get_region(b"");
+    let mut admin_req = AdminRequest::default();
+    admin_req.set_cmd_type(AdminCmdType::BatchSplit);
+
+    let mut batch_split_req = BatchSplitRequest::default();
+    batch_split_req.mut_requests().push(SplitRequest::default());
+    batch_split_req.mut_requests()[0].set_split_key(Key::from_raw(b"t10").into_encoded());
+    batch_split_req.mut_requests()[0].set_new_region_id(10);
+    batch_split_req.mut_requests()[0].set_new_peer_ids(vec![11]);
+    admin_req.set_splits(batch_split_req);
+
+    let epoch = region.get_region_epoch().clone();
+    let req = new_admin_request(1, &epoch, admin_req);
+    let _ = cluster
+        .call_command_on_leader(req, Duration::from_secs(3))
+        .unwrap();
+    // Create the initial table region by the "CREATE TABLE" statement.
+    let table_space_key = Key::from_raw(&encode_table_prefix_key(10)).into_encoded();
+    let table_region = cluster.get_region(table_space_key.as_slice());
+    info!("[for debug] table_region";
+        "region" => ?&table_region,
+    );
+
+    // Create the sharded region with sharding keys.
+    let mut admin_req2 = AdminRequest::default();
+    admin_req2.set_cmd_type(AdminCmdType::BatchSplit);
+    let mut batch_split_req2 = BatchSplitRequest::default();
+    batch_split_req2
+        .mut_requests()
+        .push(SplitRequest::default());
+    batch_split_req2
+        .mut_requests()
+        .push(SplitRequest::default());
+    batch_split_req2.mut_requests()[0]
+        .set_split_key(Key::from_raw(&encode_table_shard_prefix_key(10, 0)).into_encoded());
+    batch_split_req2.mut_requests()[0].set_new_region_id(12);
+    batch_split_req2.mut_requests()[0].set_new_peer_ids(vec![13]);
+    batch_split_req2.mut_requests()[1]
+        .set_split_key(Key::from_raw(&encode_table_shard_prefix_key(10, 1)).into_encoded());
+    batch_split_req2.mut_requests()[1].set_new_region_id(14);
+    batch_split_req2.mut_requests()[1].set_new_peer_ids(vec![15]);
+    admin_req2.set_splits(batch_split_req2);
+    let epoch = table_region.get_region_epoch().clone();
+    let req = new_admin_request(10, &epoch, admin_req2);
+    let resp = cluster
+        .call_command_on_leader(req, Duration::from_secs(3))
+        .unwrap();
+    info!("[for debug] AdminResponse";
+        "resp" => ?&resp,
+    );
+
+    let sharded_key = Key::from_raw(&encode_table_shard_row_key(10, 0, b"1")).into_encoded();
+    let hex_sharded_key = hex::hex_encode(&sharded_key);
+    let dest_region = cluster.get_region(sharded_key.as_slice());
+    info!("[for debug] dest_region";
+        "region" => ?&dest_region,
+        "sharede_key" => ?&hex_sharded_key,
+    );
+    assert!(check_is_sharded_region(&dest_region));
+
+    let sharded_key2 = Key::from_raw(&encode_table_shard_row_key(10, 1, b"1")).into_encoded();
+    let dest_region2 = cluster.get_region(sharded_key2.as_slice());
+    let hex_sharded_key2 = hex::hex_encode(&sharded_key2);
+    info!("[for debug] dest_region2";
+        "region2" => ?&dest_region2,
+        "sharede_key2" => ?&hex_sharded_key2,
+    );
+    assert!(check_is_sharded_region(&dest_region2));
+
+    info!("[for debug] >>>>>> start to put till size");
+    // The default size index distance is too large for small data, we flush
+    // multiple times to generate more size index handles.
+    let mut range = 1..;
+    for _ in 0..10 {
+        put_cf_till_size_sharding_key(&mut cluster, region_max_size, &mut range);
+    }
+
+    // Peer will split when size of region meet region_max_size, so assume the last
+    // region_max_size of data is not involved in split, there will be at least
+    // `(region_max_size * 10 - region_max_size) / region_split_size` regions.
+    // But region_max_size of data should be split too, so there will be at
+    // least 2 more regions.
+    let min_region_cnt = (region_max_size * 10 - region_max_size) / region_split_size + 4;
+
+    let mut try_cnt = 0;
+    loop {
+        sleep_ms(20);
+        let region_cnt = pd_client.get_split_count() + 1;
+        if region_cnt >= min_region_cnt as usize {
+            panic!("expect split cnt {}, got {}", min_region_cnt, region_cnt);
+        }
+        try_cnt += 1;
+        if try_cnt == 500 {
+            return;
+        }
+    }
 }
 
 #[test]

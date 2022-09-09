@@ -5712,6 +5712,7 @@ dependencies = [
  "slog-global",
  "tempfile",
  "test_util",
+ "tidb_query_datatype",
  "tikv",
  "tikv_util",
  "tokio",

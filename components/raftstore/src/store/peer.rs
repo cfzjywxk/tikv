@@ -97,7 +97,7 @@ use crate::{
         memory::{needs_evict_entry_cache, MEMTRACE_RAFT_ENTRIES},
         msg::{ErrorCallback, PeerMsg, RaftCommand, SignificantMsg, StoreMsg},
         txn_ext::LocksStatus,
-        util::{admin_cmd_epoch_lookup, RegionReadProgress},
+        util::{admin_cmd_epoch_lookup, check_is_sharded_region, RegionReadProgress},
         worker::{
             HeartbeatTask, RaftlogFetchTask, RaftlogGcTask, ReadDelegate, ReadExecutor,
             ReadProgress, RegionTask, SplitCheckTask,
@@ -915,6 +915,8 @@ where
     pub lead_transferee: u64,
     pub unsafe_recovery_state: Option<UnsafeRecoveryState>,
     pub flashback_state: Option<FlashbackState>,
+    /// If the region is a sharded region.
+    pub is_sharded_region: bool,
 }
 
 impl<EK, ER> Peer<EK, ER>
@@ -1047,7 +1049,12 @@ where
             lead_transferee: raft::INVALID_ID,
             unsafe_recovery_state: None,
             flashback_state: None,
+            is_sharded_region: false,
         };
+
+        if check_is_sharded_region(region) {
+            peer.is_sharded_region = true;
+        }
 
         // If this region has only one peer and I am the one, campaign directly.
         if region.get_peers().len() == 1 && region.get_peers()[0].get_store_id() == store_id {
@@ -1526,6 +1533,7 @@ where
             // Epoch version changed, disable read on the local reader for this region.
             self.leader_lease.expire_remote_lease();
         }
+        let is_sharded_region = check_is_sharded_region(&region);
         self.mut_store().set_region(region.clone());
         let progress = ReadProgress::region(region);
         // Always update read delegate's region to avoid stale region info after a
@@ -1543,6 +1551,9 @@ where
         }
 
         if !self.pending_remove {
+            if is_sharded_region {
+                self.is_sharded_region = true
+            }
             host.on_region_changed(
                 self.region(),
                 RegionChangeEvent::Update(reason),
@@ -4995,6 +5006,10 @@ where
                 flashback_state.finish_wait_apply();
             }
         }
+    }
+
+    pub fn is_sharded_region(&self) -> bool {
+        self.is_sharded_region
     }
 }
 

@@ -23,6 +23,7 @@ pub const RECORD_ROW_KEY_LEN: usize = PREFIX_LEN + ID_LEN;
 pub const TABLE_PREFIX: &[u8] = b"t";
 pub const RECORD_PREFIX_SEP: &[u8] = b"_r";
 pub const INDEX_PREFIX_SEP: &[u8] = b"_i";
+pub const SHARDING_PREFIX_SEP: &[u8] = b"_s";
 pub const SEP_LEN: usize = 2;
 pub const TABLE_PREFIX_LEN: usize = 1;
 pub const TABLE_PREFIX_KEY_LEN: usize = TABLE_PREFIX_LEN + ID_LEN;
@@ -100,6 +101,11 @@ pub fn check_index_key(key: &[u8]) -> Result<()> {
     check_key_type(key, INDEX_PREFIX_SEP)
 }
 
+#[inline]
+pub fn check_sharding_key(key: &[u8]) -> Result<()> {
+    check_key_type(key, SHARDING_PREFIX_SEP)
+}
+
 /// `check_key_type` checks if the key is the type we want, `wanted_type` should
 /// be `table::RECORD_PREFIX_SEP` or `table::INDEX_PREFIX_SEP` .
 #[inline]
@@ -174,6 +180,31 @@ pub fn encode_row_key(table_id: i64, handle: i64) -> Vec<u8> {
     // can't panic
     key.append_table_record_prefix(table_id).unwrap();
     key.write_i64(handle).unwrap();
+    key
+}
+
+pub fn encode_table_prefix_key(table_id: i64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(PREFIX_LEN);
+    key.append_table_record_prefix(table_id).unwrap();
+    key
+}
+
+pub fn encode_table_shard_prefix_key(table_id: i64, shard_id: u16) -> Vec<u8> {
+    let mut key = Vec::with_capacity(PREFIX_LEN + 2);
+    key.write_bytes(TABLE_PREFIX).unwrap();
+    key.write_i64(table_id).unwrap();
+    key.write_bytes(SHARDING_PREFIX_SEP).unwrap();
+    key.write_u16(shard_id).unwrap();
+    key
+}
+
+pub fn encode_table_shard_row_key(table_id: i64, shard_id: u16, handle: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(PREFIX_LEN + 2);
+    key.write_bytes(TABLE_PREFIX).unwrap();
+    key.write_i64(table_id).unwrap();
+    key.write_bytes(SHARDING_PREFIX_SEP).unwrap();
+    key.write_u16(shard_id).unwrap();
+    key.extend(handle);
     key
 }
 
