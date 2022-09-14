@@ -14,6 +14,7 @@ use tidb_query_datatype::{
     codec::{
         batch::{LazyBatchColumn, LazyBatchColumnVec},
         row, table,
+        table::check_index_key,
     },
     expr::{EvalConfig, EvalContext},
     EvalType, FieldTypeAccessor,
@@ -191,6 +192,10 @@ impl TableScanExecutorImpl {
         let mut remaining = value;
         while !remaining.is_empty() && *decoded_columns < columns_len {
             if remaining[0] != datum::VAR_INT_FLAG {
+                warn!("decode value has failed";
+                    "key" => log_wrappers::Value::key(key),
+                    "value" => log_wrappers::Value::value(value),
+                );
                 return Err(other_err!(
                     "Unable to decode row: column id must be VAR_INT"
                 ));
@@ -341,6 +346,13 @@ impl ScanExecutorImpl for TableScanExecutorImpl {
         value: &[u8],
         columns: &mut LazyBatchColumnVec,
     ) -> Result<()> {
+        if check_index_key(key).is_ok() {
+            warn!("[for debug] TableScanExecutorImpl skip sharded index key";
+                "key" => log_wrappers::Value::key(key),
+                "value" => log_wrappers::Value::value(value),
+            );
+            return Ok(());
+        }
         use tidb_query_datatype::codec::datum;
 
         let columns_len = self.schema.len();

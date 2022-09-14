@@ -19,12 +19,14 @@ use crate::{expr::EvalContext, prelude::*, FieldTypeTp};
 // handle or index id
 pub const ID_LEN: usize = 8;
 pub const PREFIX_LEN: usize = TABLE_PREFIX_LEN + ID_LEN /*table_id*/ + SEP_LEN;
+pub const SHARDING_PREFIX_LEN: usize = PREFIX_LEN + SHARD_ID_LEN + SEP_LEN;
 pub const RECORD_ROW_KEY_LEN: usize = PREFIX_LEN + ID_LEN;
 pub const TABLE_PREFIX: &[u8] = b"t";
 pub const RECORD_PREFIX_SEP: &[u8] = b"_r";
 pub const INDEX_PREFIX_SEP: &[u8] = b"_i";
 pub const SHARDING_PREFIX_SEP: &[u8] = b"_s";
 pub const SEP_LEN: usize = 2;
+pub const SHARD_ID_LEN: usize = 2;
 pub const TABLE_PREFIX_LEN: usize = 1;
 pub const TABLE_PREFIX_KEY_LEN: usize = TABLE_PREFIX_LEN + ID_LEN;
 // the maximum len of the old encoding of index value.
@@ -92,24 +94,24 @@ pub fn check_table_ranges(ranges: &[KeyRange]) -> Result<()> {
 }
 
 #[inline]
-pub fn check_record_key(key: &[u8]) -> Result<()> {
+pub fn check_record_key(key: &[u8]) -> Result<bool> {
     check_key_type(key, RECORD_PREFIX_SEP)
 }
 
 #[inline]
-pub fn check_index_key(key: &[u8]) -> Result<()> {
+pub fn check_index_key(key: &[u8]) -> Result<bool> {
     check_key_type(key, INDEX_PREFIX_SEP)
 }
 
 #[inline]
-pub fn check_sharding_key(key: &[u8]) -> Result<()> {
+pub fn check_sharding_key(key: &[u8]) -> Result<bool> {
     check_key_type(key, SHARDING_PREFIX_SEP)
 }
 
 /// `check_key_type` checks if the key is the type we want, `wanted_type` should
 /// be `table::RECORD_PREFIX_SEP` or `table::INDEX_PREFIX_SEP` .
 #[inline]
-fn check_key_type(key: &[u8], wanted_type: &[u8]) -> Result<()> {
+fn check_key_type(key: &[u8], wanted_type: &[u8]) -> Result<bool> {
     let mut buf = key;
     if buf.read_bytes(TABLE_PREFIX_LEN)? != TABLE_PREFIX {
         return Err(invalid_type!(
@@ -119,14 +121,21 @@ fn check_key_type(key: &[u8], wanted_type: &[u8]) -> Result<()> {
     }
 
     buf.read_bytes(ID_LEN)?;
-    if buf.read_bytes(SEP_LEN)? != wanted_type {
+    let mut sep = buf.read_bytes(SEP_LEN)?;
+    let mut is_sharded_key = false;
+    if sep == SHARDING_PREFIX_SEP {
+        buf.read_bytes(SHARD_ID_LEN)?;
+        sep = buf.read_bytes(SEP_LEN)?;
+        is_sharded_key = true;
+    }
+    if sep != wanted_type {
         Err(invalid_type!(
             "expected key sep type {}, but got key {})",
             log_wrappers::Value::key(wanted_type),
             log_wrappers::Value::key(key)
         ))
     } else {
-        Ok(())
+        Ok(is_sharded_key)
     }
 }
 
@@ -228,16 +237,22 @@ pub fn encode_column_key(table_id: i64, handle: i64, column_id: i64) -> Vec<u8> 
 /// `decode_int_handle` decodes the key and gets the int handle.
 #[inline]
 pub fn decode_int_handle(mut key: &[u8]) -> Result<i64> {
-    check_record_key(key)?;
-    key = &key[PREFIX_LEN..];
+    if check_record_key(key)? {
+        key = &key[SHARDING_PREFIX_LEN..];
+    } else {
+        key = &key[PREFIX_LEN..];
+    }
     key.read_i64().map_err(Error::from)
 }
 
 /// `decode_common_handle` decodes key key and gets the common handle.
 #[inline]
 pub fn decode_common_handle(mut key: &[u8]) -> Result<&[u8]> {
-    check_record_key(key)?;
-    key = &key[PREFIX_LEN..];
+    if check_record_key(key)? {
+        key = &key[SHARDING_PREFIX_LEN..];
+    } else {
+        key = &key[PREFIX_LEN..];
+    }
     Ok(key)
 }
 

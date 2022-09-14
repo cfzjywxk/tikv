@@ -790,8 +790,7 @@ pub fn put_cf_till_size_sharding_key<T: Simulator>(
     cluster: &mut Cluster<T>,
     limit: u64,
     range: &mut dyn Iterator<Item = u64>,
-) -> Vec<u8>
-{
+) -> Vec<u8> {
     let sharded_key = Key::from_raw(&encode_table_shard_row_key(10, 0, b"2")).into_encoded();
     put_cf_till_size_impl(
         cluster,
@@ -810,8 +809,7 @@ pub fn put_cf_till_size<T: Simulator>(
     cf: &'static str,
     limit: u64,
     range: &mut dyn Iterator<Item = u64>,
-) -> Vec<u8>
-{
+) -> Vec<u8> {
     put_cf_till_size_impl(cluster, cf, limit, range, b"", |key: &[u8]| -> Vec<u8> {
         key.to_vec()
     })
