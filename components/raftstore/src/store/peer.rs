@@ -818,6 +818,8 @@ where
 
     /// The counter records pending snapshot requests.
     pub pending_request_snapshot_count: Arc<AtomicUsize>,
+    /// The counter records pending parallel tasks.
+    pub pending_parallel_task_num: Arc<AtomicUsize>,
     /// The index of last scheduled committed raft log.
     pub last_applying_idx: u64,
     /// The index of last compacted raft log. It is used for the next compact
@@ -1047,6 +1049,7 @@ where
             lead_transferee: raft::INVALID_ID,
             unsafe_recovery_state: None,
             flashback_state: None,
+            pending_parallel_task_num: Arc::new(AtomicUsize::new(0)),
         };
 
         // If this region has only one peer and I am the one, campaign directly.
@@ -1117,12 +1120,23 @@ where
         ctx.apply_router
             .schedule_task(self.region_id, ApplyTask::register(self));
 
+        for sender in ctx.parallel_apply_senders.senders() {
+            let _ = sender.send((self.region_id, ApplyTask::register(self)));
+        }
+
         ctx.coprocessor_host.on_region_changed(
             self.region(),
             RegionChangeEvent::Create,
             self.get_role(),
         );
         self.maybe_gen_approximate_buckets(ctx);
+    }
+
+    /// Register self to parallel apply worker so that the peer is then usable.
+    pub fn activate_parallel_worker<T>(&self, ctx: &PollContext<EK, ER, T>) {
+        for sender in ctx.parallel_apply_senders.senders() {
+            let _ = sender.send((self.region_id, ApplyTask::register(self)));
+        }
     }
 
     #[inline]
@@ -2771,6 +2785,7 @@ where
         );
         // Leader needs to update lease.
         let mut lease_to_be_updated = self.is_leader();
+        let mut can_parallel = true;
         for entry in committed_entries.iter().rev() {
             // raft meta is very small, can be ignored.
             self.raft_log_size_hint += entry.get_data().len() as u64;
@@ -2791,7 +2806,23 @@ where
                     lease_to_be_updated = false;
                 }
             }
-
+            if ctx.cfg.enable_parallel_apply && can_parallel == true {
+                // Only logs in the current term can be parallelized.
+                // This judgment prevents raft logs from being unconstrained parallelized and
+                // breaking consistency when restarts or leader switches.
+                if entry.get_term() != self.raft_group.raft.r.term {
+                    can_parallel = false;
+                }
+                // ConfChange logs cannot be parallelized
+                if entry.get_entry_type() != EntryType::EntryNormal {
+                    can_parallel = false;
+                }
+                // Admin logs cannot be parallelized
+                let ctx = ProposalContext::from_bytes(&entry.context);
+                if !ctx.is_empty() {
+                    can_parallel = false;
+                }
+            }
             fail_point!(
                 "leader_commit_prepare_merge",
                 {
@@ -2857,8 +2888,20 @@ where
                 // Compact all cached entries instead of half evict.
                 self.mut_store().evict_entry_cache(false);
             }
-            ctx.apply_router
-                .schedule_task(self.region_id, ApplyTask::apply(apply));
+            if ctx.cfg.enable_parallel_apply
+                && self.raft_group.raft.r.state == StateRole::Leader
+                && self.cmd_epoch_checker.proposed_admin_cmd.is_empty()
+                && self.pending_request_snapshot_count.load(Ordering::SeqCst) == 0
+                && can_parallel
+            {
+                self.pending_parallel_task_num
+                    .fetch_add(1, Ordering::SeqCst);
+                ctx.parallel_apply_senders
+                    .schedule_task((self.region_id, ApplyTask::apply(apply)));
+            } else {
+                ctx.apply_router
+                    .schedule_task(self.region_id, ApplyTask::apply(apply));
+            }
         }
         fail_point!("after_send_to_apply_1003", self.peer_id() == 1003, |_| {});
     }

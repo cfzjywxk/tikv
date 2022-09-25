@@ -6,7 +6,7 @@ use std::sync::mpsc::Sender;
 use std::{
     borrow::Cow,
     cmp,
-    cmp::{Ord, Ordering as CmpOrdering},
+    cmp::{min, Ord, Ordering as CmpOrdering},
     collections::VecDeque,
     fmt::{self, Debug, Formatter},
     mem,
@@ -16,6 +16,7 @@ use std::{
         mpsc::SyncSender,
         Arc, Mutex,
     },
+    thread,
     time::Duration,
     usize,
     vec::Drain,
@@ -79,7 +80,7 @@ use crate::{
     store::{
         cmd_resp,
         entry_storage::{self, CachedEntries},
-        fsm::RaftPollerBuilder,
+        fsm::{ApplyTask, RaftPollerBuilder},
         local_metrics::{RaftMetrics, TimeTracker},
         memory::*,
         metrics::*,
@@ -343,7 +344,7 @@ pub trait Notifier<EK: KvEngine>: Send {
     fn clone_box(&self) -> Box<dyn Notifier<EK>>;
 }
 
-struct ApplyContext<EK>
+pub(crate) struct ApplyContext<EK>
 where
     EK: KvEngine,
 {
@@ -363,6 +364,12 @@ where
     kv_wb: EK::WriteBatch,
     kv_wb_last_bytes: u64,
     kv_wb_last_keys: u64,
+
+    is_parallel_applying: bool,
+    enable_parallel_applying: bool,
+    // only used in parallel worker
+    pub parallel_apply_tasks: HashMap<u64, Arc<AtomicUsize>>,
+    task_counts: HashMap<u64, usize>,
 
     committed_count: usize,
 
@@ -426,6 +433,7 @@ where
         notifier: Box<dyn Notifier<EK>>,
         cfg: &Config,
         store_id: u64,
+        is_parallel_applying: bool,
         pending_create_peers: Arc<Mutex<HashMap<u64, (u64, bool)>>>,
         priority: Priority,
     ) -> ApplyContext<EK> {
@@ -443,6 +451,10 @@ where
             kv_wb,
             applied_batch: ApplyCallbackBatch::new(),
             apply_res: vec![],
+            enable_parallel_applying: cfg.enable_parallel_apply,
+            is_parallel_applying,
+            parallel_apply_tasks: HashMap::default(),
+            task_counts: HashMap::default(),
             exec_log_index: 0,
             exec_log_term: 0,
             kv_wb_last_bytes: 0,
@@ -482,7 +494,9 @@ where
     /// This call is valid only when it's between a `prepare_for` and
     /// `finish_for`.
     pub fn commit(&mut self, delegate: &mut ApplyDelegate<EK>) {
-        if delegate.last_flush_applied_index < delegate.apply_state.get_applied_index() {
+        if delegate.last_flush_applied_index < delegate.apply_state.get_applied_index()
+            && !self.is_parallel_applying
+        {
             delegate.write_apply_state(self.kv_wb_mut());
         }
         self.commit_opt(delegate, true);
@@ -573,6 +587,23 @@ where
             }
             cb.invoke_with_response(resp);
         }
+        if self.is_parallel_applying {
+            let counts = mem::take(&mut self.task_counts);
+            for (region_id, task_num) in counts {
+                let pre_num = self
+                    .parallel_apply_tasks
+                    .get(&region_id)
+                    .unwrap()
+                    .fetch_sub(task_num, Ordering::SeqCst);
+                if pre_num == task_num {
+                    self.router.schedule_noop_task_when_not_empty(region_id);
+                }
+            }
+            if !self.apply_res.is_empty() {
+                let apply_res = mem::take(&mut self.apply_res);
+                self.notifier.notify(apply_res);
+            }
+        }
         self.apply_time.flush();
         self.apply_wait.flush();
         need_sync
@@ -583,8 +614,9 @@ where
         &mut self,
         delegate: &mut ApplyDelegate<EK>,
         results: VecDeque<ExecResult<EK::Snapshot>>,
+        first_index: u64,
     ) {
-        if !delegate.pending_remove {
+        if !delegate.pending_remove && !self.is_parallel_applying {
             delegate.write_apply_state(self.kv_wb_mut());
         }
         self.commit_opt(delegate, false);
@@ -595,6 +627,7 @@ where
             metrics: delegate.metrics.clone(),
             applied_term: delegate.applied_term,
             bucket_stat: delegate.buckets.clone().map(Box::new),
+            first_index,
         });
     }
 
@@ -869,6 +902,11 @@ where
     pending_cmds: PendingCmdQueue<Callback<EK::Snapshot>>,
     /// The counter of pending request snapshots. See more in `Peer`.
     pending_request_snapshot_count: Arc<AtomicUsize>,
+    /// The counter of pending parallel tasks. See more in `Peer`.
+    pending_parallel_task_num: Arc<AtomicUsize>,
+
+    /// The counter of pending messages after one loop
+    pending_msg_num_after_one_loop: usize,
 
     /// Indicates the peer is in merging, if that compact log won't be
     /// performed.
@@ -939,6 +977,8 @@ where
             metrics: Default::default(),
             last_merge_version: 0,
             pending_request_snapshot_count: reg.pending_request_snapshot_count,
+            pending_parallel_task_num: reg.pending_parallel_task_num,
+            pending_msg_num_after_one_loop: 0,
             // use a default `CmdObserveInfo` because observing is disable by default
             observe_info: CmdObserveInfo::default(),
             priority: Priority::Normal,
@@ -972,22 +1012,26 @@ where
         // must re-propose these commands again.
         apply_ctx.committed_count += committed_entries_drainer.len();
         let mut results = VecDeque::new();
+        let mut first_index = None;
         while let Some(entry) = committed_entries_drainer.next() {
+            if first_index.is_none() {
+                first_index = Some(entry.get_index());
+            }
             if self.pending_remove {
                 // This peer is about to be destroyed, skip everything.
                 break;
             }
 
-            let expect_index = self.apply_state.get_applied_index() + 1;
-            if expect_index != entry.get_index() {
-                panic!(
-                    "{} expect index {}, but got {}, ctx {}",
-                    self.tag,
-                    expect_index,
-                    entry.get_index(),
-                    apply_ctx.tag,
-                );
-            }
+            // let expect_index = self.apply_state.get_applied_index() + 1;
+            // if expect_index != entry.get_index() {
+            //     panic!(
+            //         "{} expect index {}, but got {}, ctx {}",
+            //         self.tag,
+            //         expect_index,
+            //         entry.get_index(),
+            //         apply_ctx.tag,
+            //     );
+            // }
 
             // NOTE: before v5.0, `EntryType::EntryConfChangeV2` entry is handled by
             // `unimplemented!()`, which can break compatibility (i.e. old version tikv
@@ -1011,7 +1055,7 @@ where
                     // Note that current entry is skipped when yield.
                     pending_entries.push(entry);
                     pending_entries.extend(committed_entries_drainer);
-                    apply_ctx.finish_for(self, results);
+                    apply_ctx.finish_for(self, results, first_index.unwrap());
                     self.yield_state = Some(YieldState {
                         pending_entries,
                         pending_msgs: Vec::default(),
@@ -1024,7 +1068,7 @@ where
                 }
             }
         }
-        apply_ctx.finish_for(self, results);
+        apply_ctx.finish_for(self, results, first_index.unwrap());
 
         if self.pending_remove {
             self.destroy(apply_ctx);
@@ -1037,6 +1081,12 @@ where
     }
 
     fn write_apply_state(&self, wb: &mut EK::WriteBatch) {
+        // info!(
+        //     "write apply state";
+        //     "apply_state" => self.apply_state.applied_index,
+        //     "region_id" => self.region.get_id(),
+        //     "thread" => thread::current().name().unwrap().to_owned()
+        // );
         wb.put_msg_cf(
             CF_RAFT,
             &keys::apply_state_key(self.region.get_id()),
@@ -1286,7 +1336,7 @@ where
                     // clear dirty values.
                     ctx.kv_wb_mut().rollback_to_save_point().unwrap();
                     match e {
-                        Error::EpochNotMatch(..) => debug!(
+                        Error::EpochNotMatch(..) => info!(
                             "epoch not match";
                             "region_id" => self.region_id(),
                             "peer_id" => self.id(),
@@ -1307,6 +1357,15 @@ where
             return (resp, exec_result, false);
         }
 
+        let name = thread::current().name().unwrap().to_owned();
+        info!(
+            "update apply_state 2";
+            "old_index" => self.apply_state.applied_index,
+            "new_index" => index,
+            "region_id" => self.region_id(),
+            "isAdmin" => req.has_admin_request(),
+            "thread" => &name,
+        );
         self.apply_state.set_applied_index(index);
         self.applied_term = term;
 
@@ -1490,7 +1549,7 @@ where
             AdminCmdType::ChangePeerV2 => self.exec_change_peer_v2(ctx, request),
             AdminCmdType::Split => self.exec_split(ctx, request),
             AdminCmdType::BatchSplit => self.exec_batch_split(ctx, request),
-            AdminCmdType::CompactLog => self.exec_compact_log(request),
+            AdminCmdType::CompactLog => self.exec_compact_log(ctx, request),
             AdminCmdType::TransferLeader => self.exec_transfer_leader(request, ctx.exec_log_term),
             AdminCmdType::ComputeHash => self.exec_compute_hash(ctx, request),
             AdminCmdType::VerifyHash => self.exec_verify_hash(ctx, request),
@@ -2744,6 +2803,7 @@ where
 
     fn exec_compact_log(
         &mut self,
+        ctx: &mut ApplyContext<EK>,
         req: &AdminRequest,
     ) -> Result<(AdminResponse, ApplyResult<EK::Snapshot>)> {
         PEER_ADMIN_CMD_COUNTER.compact.all.inc();
@@ -2787,14 +2847,17 @@ where
         }
 
         // compact failure is safe to be omitted, no need to assert.
-        compact_raft_log(
-            &self.tag,
-            &mut self.apply_state,
-            compact_index,
-            compact_term,
-        )?;
-
-        PEER_ADMIN_CMD_COUNTER.compact.success.inc();
+        // currently, compact_log may be sent to ApplyBatchSystem or to a Parallel Apply
+        // Worker, but we only do the actual processing in ApplyBatchSystem
+        if !ctx.is_parallel_applying {
+            compact_raft_log(
+                &self.tag,
+                &mut self.apply_state,
+                compact_index,
+                compact_term,
+            )?;
+            PEER_ADMIN_CMD_COUNTER.compact.success.inc();
+        }
 
         Ok((
             resp,
@@ -3048,6 +3111,7 @@ pub struct Registration {
     pub applied_term: u64,
     pub region: Region,
     pub pending_request_snapshot_count: Arc<AtomicUsize>,
+    pub pending_parallel_task_num: Arc<AtomicUsize>,
     pub is_merging: bool,
     raft_engine: Box<dyn RaftEngineReadOnly>,
 }
@@ -3061,6 +3125,7 @@ impl Registration {
             applied_term: peer.get_store().applied_term(),
             region: peer.region().clone(),
             pending_request_snapshot_count: peer.pending_request_snapshot_count.clone(),
+            pending_parallel_task_num: peer.pending_parallel_task_num.clone(),
             is_merging: peer.pending_merge_state.is_some(),
             raft_engine: Box::new(peer.get_store().engines.raft.clone()),
         }
@@ -3313,6 +3378,7 @@ where
 {
     pub region_id: u64,
     pub apply_state: RaftApplyState,
+    pub first_index: u64,
     pub applied_term: u64,
     pub exec_res: VecDeque<ExecResult<S>>,
     pub metrics: ApplyMetrics,
@@ -3355,7 +3421,9 @@ where
         ApplyFsm::from_registration(reg)
     }
 
-    fn from_registration(reg: Registration) -> (LooseBoundedSender<Msg<EK>>, Box<ApplyFsm<EK>>) {
+    pub(crate) fn from_registration(
+        reg: Registration,
+    ) -> (LooseBoundedSender<Msg<EK>>, Box<ApplyFsm<EK>>) {
         let (tx, rx) = loose_bounded(usize::MAX);
         let delegate = ApplyDelegate::from_registration(reg);
         (
@@ -3375,7 +3443,8 @@ where
             "re-register to apply delegates";
             "region_id" => self.delegate.region_id(),
             "peer_id" => self.delegate.id(),
-            "term" => reg.term
+            "term" => reg.term,
+            "applied_index" => reg.apply_state.applied_index
         );
         assert_eq!(self.delegate.id, reg.id);
         self.delegate.term = reg.term;
@@ -3438,17 +3507,17 @@ where
             buckets.meta = meta;
         }
 
-        let prev_state = (
-            self.delegate.apply_state.get_commit_index(),
-            self.delegate.apply_state.get_commit_term(),
-        );
+        // let prev_state = (
+        //     self.delegate.apply_state.get_commit_index(),
+        //     self.delegate.apply_state.get_commit_term(),
+        // );
         let cur_state = (apply.commit_index, apply.commit_term);
-        if prev_state.0 > cur_state.0 || prev_state.1 > cur_state.1 {
-            panic!(
-                "{} commit state jump backward {:?} -> {:?}",
-                self.delegate.tag, prev_state, cur_state
-            );
-        }
+        // if prev_state.0 > cur_state.0 || prev_state.1 > cur_state.1 {
+        //     panic!(
+        //         "{} commit state jump backward {:?} -> {:?}",
+        //         self.delegate.tag, prev_state, cur_state
+        //     );
+        // }
         self.delegate.apply_state.set_commit_index(cur_state.0);
         self.delegate.apply_state.set_commit_term(cur_state.1);
 
@@ -3631,6 +3700,16 @@ where
             self.delegate.last_flush_applied_index = applied_index;
         }
 
+        // let name = thread::current().name().unwrap().to_owned();
+        //
+        // info!(
+        //     "gen snapshot";
+        //     "apply_state" => self.delegate.apply_state.applied_index,
+        //     "region_id" => self.delegate.region_id(),
+        //     "thread" => name,
+        //     "flush" => need_sync,
+        // );
+
         if let Err(e) = snap_task.generate_and_schedule_snapshot::<EK>(
             apply_ctx.engine.snapshot(),
             self.delegate.applied_term,
@@ -3735,7 +3814,11 @@ where
         cb.invoke_read(resp);
     }
 
-    fn handle_tasks(&mut self, apply_ctx: &mut ApplyContext<EK>, msgs: &mut Vec<Msg<EK>>) {
+    pub(crate) fn handle_tasks(
+        &mut self,
+        apply_ctx: &mut ApplyContext<EK>,
+        msgs: &mut Vec<Msg<EK>>,
+    ) {
         let mut drainer = msgs.drain(..);
         let mut batch_apply = None;
         loop {
@@ -3777,7 +3860,13 @@ where
                             t.metrics.apply_wait_nanos = apply_wait.as_nanos() as u64;
                         });
                     }
-
+                    if apply_ctx.is_parallel_applying {
+                        apply_ctx
+                            .task_counts
+                            .entry(self.delegate.region_id())
+                            .and_modify(|counter| *counter += 1)
+                            .or_insert(1);
+                    }
                     if let Some(batch) = batch_apply.as_mut() {
                         if batch.try_batch(&mut apply) {
                             continue;
@@ -3807,6 +3896,37 @@ where
                     let delegate = &self.delegate as *const ApplyDelegate<EK> as *const u8;
                     f(delegate)
                 }
+            }
+        }
+    }
+
+    pub(crate) fn handle_task(&mut self, apply_ctx: &mut ApplyContext<EK>, msg: Msg<EK>) {
+        match msg {
+            Msg::Apply { start, apply } => {
+                let apply_wait = start.saturating_elapsed();
+                apply_ctx.apply_wait.observe(apply_wait.as_secs_f64());
+                for tracker in apply
+                    .cbs
+                    .iter()
+                    .flat_map(|p| p.cb.write_trackers())
+                    .flat_map(|ts| ts.iter().flat_map(|t| t.as_tracker_token()))
+                {
+                    GLOBAL_TRACKERS.with_tracker(tracker, |t| {
+                        t.metrics.apply_wait_nanos = apply_wait.as_nanos() as u64;
+                    });
+                }
+                if apply_ctx.is_parallel_applying {
+                    apply_ctx
+                        .task_counts
+                        .entry(self.delegate.region_id())
+                        .and_modify(|counter| *counter += 1)
+                        .or_insert(1);
+                }
+                self.handle_apply(apply_ctx, apply);
+            }
+            Msg::Registration(reg) => self.handle_registration(reg),
+            m => {
+                panic!("Unexpected msg in Parallel Apply Worker {:?}", m);
             }
         }
     }
@@ -3991,17 +4111,100 @@ where
             normal.delegate.id() == 1003,
             |_| { HandleResult::KeepProcessing }
         );
-        while self.msg_buf.len() < self.messages_per_tick {
-            match normal.receiver.try_recv() {
-                Ok(msg) => self.msg_buf.push(msg),
-                Err(TryRecvError::Empty) => {
-                    handle_result = HandleResult::stop_at(0, false);
-                    break;
+
+        if self.apply_ctx.enable_parallel_applying {
+            // In the current implementation, RaftBatchSystem will route the admin log to
+            // ApplyBatchSystem when it encounters an admin log. Before the ApplyRes for
+            // admin log is returned to RaftBatchSystem, All logs are routed to
+            // ApplyBatchSystem. Therefore, it is necessary to verify that all logs
+            // of the Parallel Apply Worker have been processed before executing
+            // admin logs in ApplyBatchSystem.
+            //
+            // However, all messages may not be processed in one loop. If the ApplyRes in
+            // the first loop contains admin logs, the RaftBatchSystem is returned
+            // to continue routing the normal logs to the Parallel Apply Worker. The
+            // normal logs piled up in ApplyBatchSystem may be starving, because they can
+            // not be executed in next loop, so we need to find a way to execute
+            // these logs.
+            //
+            // However, RaftBatchSystem may still encounter admin logs and route them to
+            // ApplyBatchSystem again, while ApplyBatchSystem may still have logs that
+            // have not been executed at this time, and the Parallel Apply Worker may not
+            // have finished executing the intermediate logs. We still need to ensure that
+            // the new admin logs that are routed to ApplyBatchSystem still meet the
+            // corresponding constraints. That is, the admin log can be executed only after
+            // all previous logs are executed.
+
+            // The solution:
+            //
+            // we record the remaining number of msg in the receiver in each loop, and judge
+            // whether the number of msg in the receiver is still consistent in the next
+            // loop. If the number is consistent, it means that no new logs are routed to
+            // ApplyBatchSystem, so there may be starving problem at this time, we need to
+            // continue to execute the logs in parallel with the Parallel Apply Worker,
+            // otherwise it indicates that at lease a new admin log has been routed to
+            // ApplyBatchSystem, and there is no starving problem at this time. We
+            // continue to wait until all the logs in the Parallel Apply Worker have
+            // been executed before executing this batch of logs.
+            //
+            let len = normal.receiver.len();
+            if len > normal.delegate.pending_msg_num_after_one_loop
+                && normal
+                    .delegate
+                    .pending_parallel_task_num
+                    .load(Ordering::SeqCst)
+                    > 0
+            {
+                // let name = thread::current().name().unwrap().to_owned();
+                // info!(
+                //     "wait for parallel worker";
+                //     "apply_state" => normal.delegate.apply_state.applied_index,
+                //     "region_id" => normal.delegate.region_id(),
+                //     "thread" => name,
+                // );
+                handle_result = HandleResult::stop_at(normal.receiver.len(), false);
+                return handle_result;
+            }
+
+            // Prevent reading the log that was just routed to applyBatchSystem after the
+            // above judgment
+            let times = min(len, self.messages_per_tick);
+            while self.msg_buf.len() < times {
+                match normal.receiver.try_recv() {
+                    Ok(msg) => self.msg_buf.push(msg),
+                    Err(TryRecvError::Empty) => {
+                        unreachable!();
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        normal.delegate.stopped = true;
+                        handle_result = HandleResult::stop_at(0, false);
+                        break;
+                    }
                 }
-                Err(TryRecvError::Disconnected) => {
-                    normal.delegate.stopped = true;
-                    handle_result = HandleResult::stop_at(0, false);
-                    break;
+            }
+
+            // If no new logs are routed in at this time, they should be the same, otherwise
+            // the latter will be larger and the next loop will need to wait instead of
+            // continuing.
+            normal.delegate.pending_msg_num_after_one_loop =
+                min(len - times, normal.receiver.len());
+
+            if normal.receiver.is_empty() {
+                handle_result = HandleResult::stop_at(0, false);
+            }
+        } else {
+            while self.msg_buf.len() < self.messages_per_tick {
+                match normal.receiver.try_recv() {
+                    Ok(msg) => self.msg_buf.push(msg),
+                    Err(TryRecvError::Empty) => {
+                        handle_result = HandleResult::stop_at(0, false);
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        normal.delegate.stopped = true;
+                        handle_result = HandleResult::stop_at(0, false);
+                        break;
+                    }
                 }
             }
         }
@@ -4086,6 +4289,7 @@ where
                 self.sender.clone_box(),
                 &cfg,
                 self.store_id,
+                false,
                 self.pending_create_peers.clone(),
                 priority,
             ),
@@ -4227,6 +4431,19 @@ where
         let (sender, apply_fsm) = ApplyFsm::from_registration(reg);
         let mailbox = BasicMailbox::new(sender, apply_fsm, self.state_cnt().clone());
         self.register(region_id, mailbox);
+    }
+
+    pub fn schedule_noop_task_when_not_empty(&self, addr: u64) {
+        self.check_do(addr, |mailbox| {
+            if mailbox.is_connected() && !mailbox.is_empty() {
+                // we only schedule a Noop ApplyTask when there are some pending messages in
+                // ApplyBatchSystem
+                self.schedule_task(addr, ApplyTask::Noop);
+                Some(0)
+            } else {
+                None
+            }
+        });
     }
 
     pub fn register(&self, region_id: u64, mailbox: BasicMailbox<ApplyFsm<EK>>) {
