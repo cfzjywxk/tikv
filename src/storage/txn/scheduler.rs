@@ -50,9 +50,12 @@ use raftstore::store::TxnExt;
 use resource_metering::{FutureExt, ResourceTagFactory};
 use tikv_kv::{Modify, Snapshot, SnapshotExt, WriteData};
 use tikv_util::{
-    deadline::Deadline, quota_limiter::QuotaLimiter, time::Instant, timer::GLOBAL_TIMER_HANDLE,
+    deadline::Deadline,
+    quota_limiter::QuotaLimiter,
+    time::{duration_to_sec, Instant},
+    timer::GLOBAL_TIMER_HANDLE,
 };
-use tracker::{get_tls_tracker_token, set_tls_tracker_token, TrackerToken};
+use tracker::{get_tls_tracker_token, set_tls_tracker_token, TrackerToken, GLOBAL_TRACKERS};
 use txn_types::TimeStamp;
 
 use crate::{
@@ -171,9 +174,15 @@ impl TaskContext {
     }
 
     fn on_schedule(&mut self) {
+        let latch_wait_saturating_elapsed = self.latch_timer.saturating_elapsed();
         SCHED_LATCH_HISTOGRAM_VEC
             .get(self.tag)
-            .observe(self.latch_timer.saturating_elapsed_secs());
+            .observe(duration_to_sec(latch_wait_saturating_elapsed));
+        self.task.as_ref().map(|task| {
+            GLOBAL_TRACKERS.with_tracker(task.tracker, |tracker| {
+                tracker.metrics.latch_wait_nanos = latch_wait_saturating_elapsed.as_nanos() as u64;
+            });
+        });
     }
 
     // Try to own this TaskContext by setting `owned` from false to true.
@@ -561,6 +570,7 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
     fn execute(&self, mut task: Task) {
         set_tls_tracker_token(task.tracker);
         let sched = self.clone();
+        let spawn_time = Instant::now();
         self.get_sched_pool(task.cmd.priority())
             .pool
             .spawn(async move {
@@ -568,6 +578,10 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
                 if sched.check_task_deadline_exceeded(&task) {
                     return;
                 }
+                GLOBAL_TRACKERS.with_tracker(task.tracker, |tracker| {
+                    tracker.metrics.scheduler_wait_nanos =
+                        spawn_time.saturating_elapsed().as_nanos() as u64;
+                });
 
                 let tag = task.cmd.tag();
                 SCHED_STAGE_COUNTER_VEC.get(tag).snapshot.inc();
@@ -908,6 +922,9 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
             TXN_COMMAND_THROTTLE_TIME_COUNTER_VEC_STATIC
                 .get(tag)
                 .inc_by(quota_delay.as_micros() as u64);
+            GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
+                tracker.metrics.throttle_nanos = quota_delay.as_nanos() as u64;
+            });
         }
 
         let WriteResult {

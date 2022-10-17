@@ -70,6 +70,9 @@ impl Tracker {
         detail.set_apply_write_leader_wait_nanos(self.metrics.apply_thread_wait_nanos);
         detail.set_apply_write_wal_nanos(self.metrics.apply_wait_nanos);
         detail.set_apply_write_memtable_nanos(self.metrics.apply_write_memtable_nanos);
+        detail.set_latch_wait_nanos(self.metrics.latch_wait_nanos);
+        detail.set_scheduler_wait_nanos(self.metrics.scheduler_wait_nanos);
+        detail.set_throttle_nanos(self.metrics.throttle_nanos);
     }
 }
 
@@ -155,4 +158,7 @@ pub struct RequestMetrics {
     pub apply_thread_wait_nanos: u64,
     pub apply_write_wal_nanos: u64,
     pub apply_write_memtable_nanos: u64,
+    pub latch_wait_nanos: u64,
+    pub scheduler_wait_nanos: u64,
+    pub throttle_nanos: u64,
 }
