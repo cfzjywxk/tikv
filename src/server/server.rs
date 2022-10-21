@@ -65,6 +65,7 @@ pub struct Server<T: RaftStoreRouter<E::Local> + 'static, S: StoreAddrResolver +
     ///
     /// If the listening port is configured, the server will be started lazily.
     builder_or_server: Option<Either<ServerBuilder, GrpcServer>>,
+    builder_or_server_for_uds: Option<Either<ServerBuilder, GrpcServer>>,
     grpc_mem_quota: ResourceQuota,
     local_addr: SocketAddr,
     // Transport.
@@ -140,12 +141,15 @@ impl<T: RaftStoreRouter<E::Local> + Unpin, S: StoreAddrResolver + 'static, E: En
             proxy,
             cfg.value().reject_messages_on_memory_ratio,
         );
+        let kv_service_for_uds = kv_service.clone();
 
         let addr = SocketAddr::from_str(&cfg.value().addr)?;
         let ip = format!("{}", addr.ip());
+        info!("[for debug] ip={}", &ip);
         let mem_quota = ResourceQuota::new(Some("ServerMemQuota"))
             .resize_memory(cfg.value().grpc_memory_pool_quota.0 as usize);
-        let channel_args = ChannelBuilder::new(Arc::clone(&env))
+        let channel_builder = ChannelBuilder::new(Arc::clone(&env));
+        let channel_args = channel_builder
             .stream_initial_window_size(cfg.value().grpc_stream_initial_window_size.0 as i32)
             .max_concurrent_stream(cfg.value().grpc_concurrent_stream)
             .max_receive_message_len(-1)
@@ -163,6 +167,18 @@ impl<T: RaftStoreRouter<E::Local> + Unpin, S: StoreAddrResolver + 'static, E: En
                 .register_service(create_health(health_service.clone()));
             sb = security_mgr.bind(sb, &ip, addr.port());
             Either::Left(sb)
+        };
+        let uds = cfg.value().uds.clone();
+
+        info!("[for debug] uds_addr={} ip={}", &uds, &ip);
+        let builder_for_uds = if !uds.is_empty() {
+            let channel_builder = ChannelBuilder::new(Arc::clone(&env));
+            let uds_sb = ServerBuilder::new(Arc::clone(&env))
+                .channel_args(channel_builder.build_args())
+                .register_service(create_tikv(kv_service_for_uds));
+            Some(Either::Left(uds_sb.bind(format!("unix:/{}", &uds), 0)))
+        } else {
+            None
         };
 
         let conn_builder = ConnectionBuilder::new(
@@ -182,6 +198,7 @@ impl<T: RaftStoreRouter<E::Local> + Unpin, S: StoreAddrResolver + 'static, E: En
         let svr = Server {
             env: Arc::clone(&env),
             builder_or_server: Some(builder),
+            builder_or_server_for_uds: builder_for_uds,
             grpc_mem_quota: mem_quota,
             local_addr: addr,
             trans,
@@ -268,6 +285,19 @@ impl<T: RaftStoreRouter<E::Local> + Unpin, S: StoreAddrResolver + 'static, E: En
         grpc_server.start();
         self.builder_or_server = Some(Either::Right(grpc_server));
 
+        if self.builder_or_server_for_uds.is_some() {
+            let uds_builder = self
+                .builder_or_server_for_uds
+                .take()
+                .unwrap()
+                .left()
+                .unwrap();
+            let mut uds_server = uds_builder.build()?;
+            info!("[for debug]listening on uds_grpc_server");
+            uds_server.start();
+            self.builder_or_server_for_uds = Some(Either::Right(uds_server));
+        }
+
         // Note this should be called only after grpc server is started.
         let mut grpc_load_stats = {
             let tl = Arc::clone(&self.grpc_thread_load);
@@ -316,6 +346,9 @@ impl<T: RaftStoreRouter<E::Local> + Unpin, S: StoreAddrResolver + 'static, E: En
     /// Stops the TiKV server.
     pub fn stop(&mut self) -> Result<()> {
         self.snap_worker.stop();
+        if let Some(Either::Right(mut uds_server)) = self.builder_or_server_for_uds.take() {
+            uds_server.shutdown();
+        }
         if let Some(Either::Right(mut server)) = self.builder_or_server.take() {
             server.shutdown();
         }

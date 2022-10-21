@@ -68,6 +68,10 @@ pub struct Config {
     #[online_config(skip)]
     pub addr: String,
 
+    // Server listening unix domain socket.
+    #[online_config(skip)]
+    pub uds: String,
+
     // Server advertise listening address for outer communication.
     // If not set, we will use listening address instead.
     #[online_config(skip)]
@@ -210,6 +214,7 @@ impl Default for Config {
         Config {
             cluster_id: DEFAULT_CLUSTER_ID,
             addr: DEFAULT_LISTENING_ADDR.to_owned(),
+            uds: String::new(),
             labels: HashMap::default(),
             advertise_addr: DEFAULT_ADVERTISE_LISTENING_ADDR.to_owned(),
             status_addr: DEFAULT_STATUS_ADDR.to_owned(),

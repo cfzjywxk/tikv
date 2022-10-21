@@ -149,6 +149,8 @@
 ## Listening address.
 # addr = "127.0.0.1:20160"
 
+# uds = "/tmp/tikv.socket"
+
 ## Advertise listening address for client communication.
 ## If not set, `addr` will be used.
 # advertise-addr = ""
