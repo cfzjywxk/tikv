@@ -35,6 +35,7 @@ use resource_metering::CollectorRegHandle;
 use tempfile::Builder;
 use test_raftstore::*;
 use test_raftstore_macro::test_case;
+use test_util::init_log_for_test;
 use tikv::{
     config::QuotaConfig,
     coprocessor::REQ_TYPE_DAG,
@@ -2407,6 +2408,7 @@ fn test_storage_with_quota_limiter_disable() {
 
 #[test]
 fn test_commands_write_detail() {
+    init_log_for_test();
     let (_cluster, client, ctx) = must_new_and_configure_cluster_and_kv_client(|cluster| {
         cluster.cfg.pessimistic_txn.pipelined = false;
         cluster.cfg.pessimistic_txn.in_memory = false;
@@ -2430,6 +2432,7 @@ fn test_commands_write_detail() {
         // assert!(wd.get_apply_mutex_lock_nanos() > 0);
         assert!(wd.get_apply_write_wal_nanos() > 0);
         assert!(wd.get_apply_write_memtable_nanos() > 0);
+        assert!(wd.get_process_nanos() > 0);
     };
 
     let mut mutation = Mutation::default();
@@ -2443,7 +2446,13 @@ fn test_commands_write_detail() {
     pessimistic_lock_req.set_for_update_ts(20);
     pessimistic_lock_req.set_primary_lock(k.clone());
     pessimistic_lock_req.set_lock_ttl(3000);
+    info!("[for debug] before client.kv_pessimistic_lock";
+        "req" => ?&pessimistic_lock_req,
+    );
     let pessimistic_lock_resp = client.kv_pessimistic_lock(&pessimistic_lock_req).unwrap();
+    info!("[for debug] after client.kv_pessimistic_lock";
+        "resp" => ?&pessimistic_lock_resp,
+    );
     check_scan_detail(
         pessimistic_lock_resp
             .get_exec_details_v2()

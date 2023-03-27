@@ -52,7 +52,9 @@ use resource_metering::{FutureExt, ResourceTagFactory};
 use smallvec::{smallvec, SmallVec};
 use tikv_kv::{Modify, Snapshot, SnapshotExt, WriteData, WriteEvent};
 use tikv_util::{quota_limiter::QuotaLimiter, time::Instant, timer::GLOBAL_TIMER_HANDLE};
-use tracker::{get_tls_tracker_token, set_tls_tracker_token, TrackerToken};
+use tracker::{
+    get_tls_tracker_token, set_tls_tracker_token, TrackGuard, TrackerToken, GLOBAL_TRACKERS,
+};
 use txn_types::TimeStamp;
 
 use crate::{
@@ -188,9 +190,15 @@ impl TaskContext {
     }
 
     fn on_schedule(&mut self) {
+        let elapsed = self.latch_timer.saturating_elapsed();
+        if let Some(task) = &self.task.as_ref() {
+            GLOBAL_TRACKERS.with_tracker(task.tracker, |tracker| {
+                tracker.metrics.latch_wait_nanos = elapsed.as_nanos() as u64;
+            });
+        }
         SCHED_LATCH_HISTOGRAM_VEC
             .get(self.tag)
-            .observe(self.latch_timer.saturating_elapsed_secs());
+            .observe(elapsed.as_secs_f64());
     }
 
     // Try to own this TaskContext by setting `owned` from false to true.
@@ -1091,11 +1099,18 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
             }
 
             fail_point!("scheduler_process");
+            let tracker_token = task.tracker;
             if task.cmd.readonly() {
                 self.process_read(snapshot, task, &mut statistics);
             } else {
                 self.process_write(snapshot, task, &mut statistics).await;
             };
+            GLOBAL_TRACKERS.with_tracker(tracker_token, |t|{
+                info!("[for debug] TxnScheduler.process after self.process_write";
+                    "token" => ?tracker_token,
+                    "tracker" => ?t,
+                );
+            });
             tls_collect_scan_details(tag.get_str(), &statistics);
             let elapsed = timer.saturating_elapsed();
             slow_log!(
@@ -1166,7 +1181,15 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
             return;
         }
         let raw_ext = raw_ext.unwrap();
+        let tracker_token = tracker;
+        GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
+            info!("[for debug] TxnScheduler with_tracker";
+                "token" => ?tracker_token,
+                "tracker" => ?tracker,
+            );
+        });
 
+        let begin_instant = Instant::now();
         let deadline = task.cmd.deadline();
         let write_result = {
             let _guard = sample.observe_cpu();
@@ -1178,20 +1201,26 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
                 async_apply_prewrite: self.inner.enable_async_apply_prewrite,
                 raw_ext,
             };
-            let begin_instant = Instant::now();
-            let res = unsafe {
+            unsafe {
                 with_perf_context::<E, _, _>(tag, || {
                     task.cmd
                         .process_write(snapshot, context)
                         .map_err(StorageError::from)
                 })
-            };
-            SCHED_PROCESSING_READ_HISTOGRAM_STATIC
-                .get(tag)
-                .observe(begin_instant.saturating_elapsed_secs());
-            res
+            }
         };
+        let process_end = Instant::now();
+        let process_duration = process_end.saturating_duration_since(begin_instant);
+        SCHED_PROCESSING_READ_HISTOGRAM_STATIC
+            .get(tag)
+            .observe(process_duration.as_secs_f64());
+        let mut total_process_duration =
+            TrackGuard::new(tracker, |m| &mut m.scheduler_process_nanos);
+        total_process_duration.value += process_duration.as_nanos() as u64;
 
+        SCHED_PROCESSING_READ_HISTOGRAM_STATIC
+            .get(tag)
+            .observe(begin_instant.saturating_elapsed_secs());
         if write_result.is_ok() {
             // TODO: write bytes can be a bit inaccurate due to error requests or in-memory
             // pessimistic locks.
@@ -1202,7 +1231,17 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
             + statistics.cf_statistics(CF_WRITE).flow_stats.read_bytes;
         sample.add_read_bytes(read_bytes);
         let quota_delay = quota_limiter.consume_sample(sample, true).await;
+        /*
+        let mut total_throttle_duration =
+            TrackGuard::new(tracker, |m| &mut m.scheduler_throttle_nanos);
+        */
         if !quota_delay.is_zero() {
+            /*
+            let actual_quota_delay = process_end.saturating_elapsed();
+            GLOBAL_TRACKERS.with_tracker(tracker, |t| {
+                t.metrics.scheduler_throttle_nanos += actual_quota_delay.as_nanos() as u64;
+            });
+            */
             TXN_COMMAND_THROTTLE_TIME_COUNTER_VEC_STATIC
                 .get(tag)
                 .inc_by(quota_delay.as_micros() as u64);
@@ -1305,32 +1344,36 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
         if (tag == CommandKind::acquire_pessimistic_lock
             || tag == CommandKind::acquire_pessimistic_lock_resumed)
             && pessimistic_lock_mode == PessimisticLockMode::InMemory
-            && self.try_write_in_memory_pessimistic_locks(
+        {
+            let begin_instant = Instant::now();
+            if self.try_write_in_memory_pessimistic_locks(
                 txn_ext.as_deref(),
                 &mut to_be_write,
                 &ctx,
-            )
-        {
-            // Safety: `self.sched_pool` ensures a TLS engine exists.
-            unsafe {
-                with_tls_engine(|engine: &mut E| {
-                    // We skip writing the raftstore, but to improve CDC old value hit rate,
-                    // we should send the old values to the CDC scheduler.
-                    engine.schedule_txn_extra(to_be_write.extra);
-                })
+            ) {
+                // Safety: `self.sched_pool` ensures a TLS engine exists.
+                unsafe {
+                    with_tls_engine(|engine: &mut E| {
+                        // We skip writing the raftstore, but to improve CDC old value hit rate,
+                        // we should send the old values to the CDC scheduler.
+                        engine.schedule_txn_extra(to_be_write.extra);
+                    })
+                }
+                total_process_duration.value +=
+                    begin_instant.saturating_elapsed().as_nanos() as u64;
+                scheduler.on_write_finished(
+                    cid,
+                    pr,
+                    Ok(()),
+                    lock_guards,
+                    false,
+                    false,
+                    new_acquired_locks,
+                    tag,
+                    &group_name,
+                );
+                return;
             }
-            scheduler.on_write_finished(
-                cid,
-                pr,
-                Ok(()),
-                lock_guards,
-                false,
-                false,
-                new_acquired_locks,
-                tag,
-                &group_name,
-            );
-            return;
         }
 
         let mut is_async_apply_prewrite = false;
@@ -1383,7 +1426,9 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
                         .await
                         .unwrap();
                 }
-                SCHED_THROTTLE_TIME.observe(start.saturating_elapsed_secs());
+                let elapsed = start.saturating_elapsed();
+                SCHED_THROTTLE_TIME.observe(elapsed.as_secs_f64());
+                //total_throttle_duration.value += elapsed.as_nanos() as u64;
             }
         }
 
@@ -1537,6 +1582,7 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
         // is undeterministic. in this case, we don't know whether the
         // request is finished or not, so we should not release latch as
         // it may break correctness.
+        total_process_duration.value += begin_instant.saturating_elapsed().as_nanos() as u64;
     }
 
     /// Returns whether it succeeds to write pessimistic locks to the in-memory
