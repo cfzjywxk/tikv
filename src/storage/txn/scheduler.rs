@@ -332,15 +332,12 @@ impl<L: LockManager> SchedulerInner<L> {
         tctx
     }
 
-    /// Try to own the corresponding task context and take the callback.
-    ///
-    /// If the task is been processing, it should be owned.
-    /// If it has been finished, then it is not in the slot.
-    /// In both cases, cb should be None. Otherwise, cb should be some.
-    fn try_own_and_take_cb(&self, cid: u64) -> Option<SchedulerTaskCallback> {
+    // Try to own this task, a task could be owned at most one time.
+    fn try_own(&self, cid: u64) -> bool {
         self.get_task_slot(cid)
             .get_mut(&cid)
-            .and_then(|tctx| if tctx.try_own() { tctx.cb.take() } else { None })
+            .map(|tctx| tctx.try_own())
+            .unwrap_or(false)
     }
 
     fn take_task_cb(&self, cid: u64) -> Option<SchedulerTaskCallback> {
@@ -585,22 +582,12 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
                 } {
                     // Precheck failed, try to return err early.
                     Err(e) => {
-                        let cb = sched.inner.try_own_and_take_cb(cid);
                         // The task is not processing or finished currently. It's safe
                         // to response early here. In the future, the task will be waked up
                         // and it will finished with DeadlineExceeded error.
                         // As the cb is taken here, it will not be executed anymore.
-                        if let Some(cb) = cb {
-                            let pr = ProcessResult::Failed {
-                                err: StorageError::from(e),
-                            };
-                            Self::early_response(
-                                cid,
-                                cb,
-                                pr,
-                                tag,
-                                CommandStageKind::precheck_write_err,
-                            );
+                        if sched.inner.try_own(cid) {
+                            sched.finish_with_err(cid, StorageError::from(e));
                         }
                     }
                     Ok(()) => {
@@ -611,11 +598,11 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
                             .compat()
                             .await
                             .unwrap();
-                        let cb = sched.inner.try_own_and_take_cb(cid);
-                        if let Some(cb) = cb {
-                            cb.execute(ProcessResult::Failed {
-                                err: StorageErrorInner::DeadlineExceeded.into(),
-                            })
+                        if sched.inner.try_own(cid) {
+                            sched.finish_with_err(
+                                cid,
+                                StorageError::from(StorageErrorInner::DeadlineExceeded),
+                            );
                         }
                     }
                 }
@@ -641,7 +628,9 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
                     .worker_pool
                     .pool
                     .spawn(async move {
-                        this.finish_with_err(cid, err);
+                        if this.inner.try_own(cid) {
+                            this.finish_with_err(cid, err);
+                        }
                     })
                     .unwrap();
             }
@@ -686,6 +675,10 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
         self.get_sched_pool(task.cmd.priority())
             .pool
             .spawn(async move {
+                if !sched.inner.try_own(task.cid) {
+                    sched.finish_with_err(task.cid, StorageErrorInner::DeadlineExceeded);
+                    return;
+                }
                 fail_point!("scheduler_start_execute");
                 if sched.check_task_deadline_exceeded(&task) {
                     return;
@@ -714,17 +707,6 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
                         SCHED_STAGE_COUNTER_VEC.get(tag).snapshot_ok.inc();
                         let term = snapshot.ext().get_term();
                         let extra_op = snapshot.ext().get_txn_extra_op();
-                        if !sched
-                            .inner
-                            .get_task_slot(task.cid)
-                            .get(&task.cid)
-                            .unwrap()
-                            .try_own()
-                        {
-                            sched.finish_with_err(task.cid, StorageErrorInner::DeadlineExceeded);
-                            return;
-                        }
-
                         if let Some(term) = term {
                             task.cmd.ctx_mut().set_term(term.get());
                         }
@@ -749,18 +731,37 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
     }
 
     /// Calls the callback with an error.
+    /// The `owned` flag is used to ensure each task could be finished only one
+    /// time.
     fn finish_with_err<ER>(&self, cid: u64, err: ER)
     where
         StorageError: From<ER>,
     {
-        debug!("write command finished with error"; "cid" => cid);
+        let storage_err = StorageError::from(err);
+        debug!("write task={} finished with error={:?}", cid, storage_err,);
         let tctx = self.inner.dequeue_task_context(cid);
 
-        SCHED_STAGE_COUNTER_VEC.get(tctx.tag).error.inc();
+        match &storage_err {
+            StorageError(box StorageErrorInner::DeadlineExceeded) => {
+                SCHED_STAGE_COUNTER_VEC
+                    .get(tctx.tag)
+                    .deadline_exceeded_error
+                    .inc();
+                // If this task is finished because of timeout, it must be
+                // waiting for latch held by some other tasks.
+                // As the task would not be processed anymore, clear the latch
+                // waiting info and observe the latch wait duration here.
+                self.inner.latches.clear_waiting_info(&tctx.lock, cid);
+                SCHED_LATCH_HISTOGRAM_VEC
+                    .get(tctx.tag)
+                    .observe(tctx.latch_timer.saturating_elapsed_secs());
+            }
+            _ => {
+                SCHED_STAGE_COUNTER_VEC.get(tctx.tag).error.inc();
+            }
+        }
 
-        let pr = ProcessResult::Failed {
-            err: StorageError::from(err),
-        };
+        let pr = ProcessResult::Failed { err: storage_err };
         if let Some(cb) = tctx.cb {
             cb.execute(pr);
         }
@@ -775,6 +776,8 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
     ///
     /// If a next command is present, continues to execute; otherwise, delivers
     /// the result to the callback.
+    /// The `owned` flag is used to ensure each task could be finished only one
+    /// time.
     fn on_read_finished(&self, cid: u64, pr: ProcessResult, tag: CommandKind) {
         SCHED_STAGE_COUNTER_VEC.get(tag).read_finish.inc();
 
@@ -791,6 +794,8 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
     }
 
     /// Event handler for the success of write.
+    /// The `owned` flag is used to ensure each task could be finished only one
+    /// time.
     fn on_write_finished(
         &self,
         cid: u64,
@@ -1758,6 +1763,7 @@ mod tests {
 
     use futures_executor::block_on;
     use kvproto::kvrpcpb::{BatchRollbackRequest, CheckTxnStatusRequest, Context};
+    use num_traits::ToPrimitive;
     use raftstore::store::{ReadStats, WriteStats};
     use tikv_util::{config::ReadableSize, future::paired_future_callback};
     use txn_types::{Key, TimeStamp};
@@ -1982,6 +1988,9 @@ mod tests {
             block_on(f).unwrap(),
             Err(StorageError(box StorageErrorInner::DeadlineExceeded))
         ));
+        // The task observation should already be done and there's no pending tasks.
+        assert_eq!(SCHED_CONTEX_GAUGE.get().to_u64().unwrap(), 0);
+        thread::sleep(Duration::from_millis(200));
         scheduler.release_latches(lock, cid, None);
 
         // A new request should not be blocked.
@@ -1992,6 +2001,38 @@ mod tests {
         let (cb, f) = paired_future_callback();
         scheduler.run_cmd(cmd.cmd, StorageCallback::Boolean(cb));
         block_on(f).unwrap().unwrap();
+
+        // Lock "b" again.
+        let mut lock = Lock::new(&[Key::from_raw(b"b")]);
+        let cid = scheduler.inner.gen_id();
+        assert!(scheduler.inner.latches.acquire(&mut lock, cid));
+
+        // The req is blocked.
+        let mut req = BatchRollbackRequest::default();
+        req.mut_context().max_execution_duration_ms = 100;
+        req.set_keys(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()].into());
+        let cmd: TypedCommand<()> = req.into();
+        let (cb, f) = paired_future_callback();
+        scheduler.run_cmd(cmd.cmd, StorageCallback::Boolean(cb));
+
+        // The req1 is blocked by req1. After req has timed out, req1 should be executed
+        // and there should be no timeout errors.
+        let mut req1 = BatchRollbackRequest::default();
+        req1.mut_context().max_execution_duration_ms = 300;
+        req1.set_keys(vec![b"a".to_vec()].into());
+        let cmd1: TypedCommand<()> = req1.into();
+        let (cb1, f1) = paired_future_callback();
+        scheduler.run_cmd(cmd1.cmd, StorageCallback::Boolean(cb1));
+
+        // The task waits for 200ms until it acquires the latch, but the execution
+        // time limit is 100ms. Before the latch is released, it should return
+        // DeadlineExceeded error.
+        thread::sleep(Duration::from_millis(150));
+        assert!(matches!(
+            block_on(f).unwrap(),
+            Err(StorageError(box StorageErrorInner::DeadlineExceeded))
+        ));
+        block_on(f1).unwrap().unwrap();
     }
 
     /// When all latches are acquired, the command should be executed directly.
@@ -2035,9 +2076,8 @@ mod tests {
         // The task context should be owned, and it's cb should be taken.
         let cid2 = cid + 1; // Hack: get the cid of req2.
         let mut task_slot = scheduler.inner.get_task_slot(cid2);
-        let tctx = task_slot.get_mut(&cid2).unwrap();
-        assert!(!tctx.try_own());
-        assert!(tctx.cb.is_none());
+        assert!(task_slot.get_mut(&cid2).is_none());
+        assert_eq!(SCHED_CONTEX_GAUGE.get().to_u64().unwrap(), 0);
     }
 
     #[test]
