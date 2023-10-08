@@ -288,9 +288,11 @@ fn test_update_resoved_ts_before_apply_index() {
     sleep_ms(100);
 
     // The leader can't handle stale read with `commit_ts2` because its `safe_ts`
-    // can't update due to its `apply_index` not update
+    // can't update due to its `apply_index` not update.
+    // The request would be handled as a snapshot read on the valid leader peer
+    // after fallback.
     let resp = leader_client.kv_read(b"key1".to_vec(), commit_ts2);
-    assert!(resp.get_region_error().has_data_is_not_ready(),);
+    assert_eq!(resp.get_value(), b"value2");
     // The follower can't handle stale read with `commit_ts2` because it don't
     // have enough data
     let resp = follower_client2.kv_read(b"key1".to_vec(), commit_ts2);
