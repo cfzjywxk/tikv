@@ -1074,6 +1074,12 @@ where
                         ) {
                             Ok(read_resp) => read_resp,
                             Err(err_resp) => {
+                                cb.set_result(ReadResponse {
+                                    response: err_resp,
+                                    snapshot: None,
+                                    txn_extra_op: TxnExtraOp::Noop,
+                                });
+                                return;
                                 // It's safe to change the header of the `RaftCmdRequest`, as it
                                 // would not affect the `SnapCtx` used in upper layer like.
                                 let unset_stale_flag = req.get_header().get_flags()
