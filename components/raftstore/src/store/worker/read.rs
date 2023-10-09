@@ -1262,7 +1262,7 @@ impl<'r> RequestInspector for Inspector<'r> {
             // We skip lease check, because it is postponed until `handle_read`.
             LeaseState::Valid
         } else {
-            debug!("rejected by leader lease"; "tag" => &self.delegate.tag);
+            info!("rejected by leader lease"; "tag" => &self.delegate.tag);
             TLS_LOCAL_READ_METRICS.with(|m| m.borrow_mut().reject_reason.no_lease.inc());
             LeaseState::Expired
         }

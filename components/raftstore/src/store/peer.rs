@@ -5522,12 +5522,14 @@ pub trait RequestInspector {
         }
 
         if req.get_header().get_read_quorum() {
+            info!("[for debug] get_read_quorum is set, return ReadIndex");
             return Ok(RequestPolicy::ReadIndex);
         }
 
         // If applied index's term differs from current raft's term, leader
         // transfer must happened, if read locally, we may read old value.
         if !self.has_applied_to_current_term() {
+            info!("[for debug] has_applied_to_current_term check fails, return ReadIndex");
             return Ok(RequestPolicy::ReadIndex);
         }
 
