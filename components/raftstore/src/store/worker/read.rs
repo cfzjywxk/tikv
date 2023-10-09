@@ -1074,6 +1074,8 @@ where
                         ) {
                             Ok(read_resp) => read_resp,
                             Err(err_resp) => {
+                                // It's safe to change the header of the `RaftCmdRequest`, as it
+                                // would not affect the `SnapCtx` used in upper layer like.
                                 let unset_stale_flag = req.get_header().get_flags()
                                     & (!WriteBatchFlags::STALE_READ.bits());
                                 req.mut_header().set_flags(unset_stale_flag);
@@ -1102,11 +1104,16 @@ where
                                 ) {
                                     TLS_LOCAL_READ_METRICS.with(|m| {
                                         m.borrow_mut()
-                                            .local_executed_stale_read_fallback_requests
+                                            .local_executed_stale_read_fallback_success_requests
                                             .inc()
                                     });
                                     read_resp
                                 } else {
+                                    TLS_LOCAL_READ_METRICS.with(|m| {
+                                        m.borrow_mut()
+                                            .local_executed_stale_read_fallback_failure_requests
+                                            .inc()
+                                    });
                                     cb.set_result(ReadResponse {
                                         response: err_resp,
                                         snapshot: None,
