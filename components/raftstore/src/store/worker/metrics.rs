@@ -104,6 +104,10 @@ pub fn maybe_tls_local_read_metrics_flush() {
         if m.last_flush_time.saturating_elapsed() >= Duration::from_millis(METRICS_FLUSH_INTERVAL) {
             m.local_executed_requests.flush();
             m.local_executed_stale_read_requests.flush();
+            m.local_executed_stale_read_fallback_success_requests
+                .flush();
+            m.local_executed_stale_read_fallback_failure_requests
+                .flush();
             m.local_executed_replica_read_requests.flush();
             m.local_executed_snapshot_cache_hit.flush();
             m.reject_reason.flush();
