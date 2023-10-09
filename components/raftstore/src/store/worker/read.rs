@@ -23,7 +23,7 @@ use kvproto::{
 use pd_client::BucketMeta;
 use tikv_util::{
     codec::number::decode_u64,
-    debug, error,
+    debug, error, info,
     lru::LruCache,
     store::find_peer_by_id,
     time::{monotonic_raw_now, ThreadReadId},
@@ -1084,9 +1084,17 @@ where
                                 };
                                 // The read request could be handled using snapshot read if the
                                 // local peer is a valid leader.
-                                let allow_fallback_leader_read = inspector
-                                    .inspect(&req)
-                                    .map_or(false, |r| r == RequestPolicy::ReadLocal);
+                                let inspected_policy = inspector.inspect(&req);
+                                let allow_fallback_leader_read = inspected_policy
+                                    .as_ref()
+                                    .map_or(false, |r| (*r) == RequestPolicy::ReadLocal);
+                                let is_in_leader_lease =
+                                    delegate.is_in_leader_lease(monotonic_raw_now());
+                                info!("[for debug] stale read encounters data is not ready err";
+                                    "fallback inspected_policy" => ?inspected_policy,
+                                    "is_in_leader_lease" => is_in_leader_lease,
+                                    "allow_fallback_leader_read" => allow_fallback_leader_read,
+                                );
                                 if !allow_fallback_leader_read {
                                     cb.set_result(ReadResponse {
                                         response: err_resp,
@@ -1102,6 +1110,9 @@ where
                                     &mut snap_updated,
                                     last_valid_ts,
                                 ) {
+                                    info!(
+                                        "[for debug] stale read encounters data is not ready err, fallback leader read success"
+                                    );
                                     TLS_LOCAL_READ_METRICS.with(|m| {
                                         m.borrow_mut()
                                             .local_executed_stale_read_fallback_success_requests
@@ -1109,6 +1120,9 @@ where
                                     });
                                     read_resp
                                 } else {
+                                    info!(
+                                        "[for debug] stale read encounters data is not ready err, fallback leader read fail, possible not in lease"
+                                    );
                                     TLS_LOCAL_READ_METRICS.with(|m| {
                                         m.borrow_mut()
                                             .local_executed_stale_read_fallback_failure_requests
