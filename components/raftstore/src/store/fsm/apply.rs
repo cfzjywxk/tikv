@@ -665,15 +665,16 @@ where
         results: VecDeque<ExecResult<EK::Snapshot>>,
     ) {
         if self.host.pre_persist(&delegate.region, true, None) {
-            if !delegate.pending_remove {
-                delegate.maybe_write_apply_state(self);
-            } else {
-                info!(">>> apply state is not written into the write batch";
-                    "region" => ?delegate.region,
-                    "tag" => &delegate.tag,
-                    "pending_remove" => delegate.pending_remove,
-                );
-            }
+            delegate.maybe_write_apply_state(self);
+            // if !delegate.pending_remove {
+            //     delegate.maybe_write_apply_state(self);
+            // } else {
+            //     info!(">>> apply state is not written into the write batch";
+            //         "region" => ?delegate.region,
+            //         "tag" => &delegate.tag,
+            //         "pending_remove" => delegate.pending_remove,
+            //     );
+            // }
             self.commit_opt(delegate, false);
         } else {
             info!("do not persist when finish_for";
