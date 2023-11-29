@@ -2504,4 +2504,15 @@ pub mod tests {
         assert_eq!(lock.versions_to_last_change, 0);
         must_rollback(&mut engine, key, 40, false);
     }
+
+    #[test]
+    fn test_from_raw() {
+        test_util::init_log_for_test();
+
+        let raw_key = hex::decode("74800000000000156B5F7201765F363435393334FF303333\
+        3032363135FF3836633531633865FF3363303738643433FF3433373266353730FF3065000000000000F9016465\
+        6661756C7400FE03979B9F778AE9D8C0").unwrap();      // This is the raw key in hex format.
+        let key = Key::from_raw(raw_key.as_slice()); // Turn it into the mvcc key in tikv.
+        info!("[for debug] key={}", key);                 // Display the result.
+    }
 }
