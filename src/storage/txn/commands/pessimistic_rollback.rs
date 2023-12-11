@@ -11,8 +11,8 @@ use crate::storage::{
     mvcc::{MvccTxn, Result as MvccResult, SnapshotReader},
     txn::{
         commands::{
-            Command, CommandExt, ReaderWithStats, ReleasedLocks, ResponsePolicy, TypedCommand,
-            WriteCommand, WriteContext, WriteResult,
+            Command, CommandExt, ReaderWithStats, ReleasedLocks, ResolveLockReadPhase,
+            ResponsePolicy, TypedCommand, WriteCommand, WriteContext, WriteResult,
         },
         Result,
     },
@@ -32,6 +32,8 @@ command! {
             /// The transaction timestamp.
             start_ts: TimeStamp,
             for_update_ts: TimeStamp,
+            /// The next scan key is resolve lock read is used firstly.
+            scan_key: Option<Key>,
         }
 }
 
@@ -83,6 +85,20 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for PessimisticRollback {
             released_locks.push(released_lock?);
         }
 
+        let pr = if self.scan_key.is_none() {
+            ProcessResult::Res
+        } else {
+            ProcessResult::NextCommand {
+                cmd: ResolveLockReadPhase::new_for_pessimistic_rollback(
+                    self.start_ts,
+                    self.for_update_ts,
+                    self.scan_key.take(),
+                    ctx.clone(),
+                )
+                .cmd,
+            }
+        };
+
         let new_acquired_locks = txn.take_new_locks();
         let mut write_data = WriteData::from_modifies(txn.into_modifies());
         write_data.set_allowed_on_disk_almost_full();
@@ -90,7 +106,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for PessimisticRollback {
             ctx,
             to_be_write: write_data,
             rows,
-            pr: ProcessResult::MultiRes { results: vec![] },
+            pr,
             lock_info: vec![],
             released_locks,
             new_acquired_locks,
@@ -105,7 +121,6 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for PessimisticRollback {
 pub mod tests {
     use concurrency_manager::ConcurrencyManager;
     use kvproto::kvrpcpb::Context;
-    use tikv_util::deadline::Deadline;
     use txn_types::Key;
 
     use super::*;
@@ -113,12 +128,7 @@ pub mod tests {
         kv::Engine,
         lock_manager::MockLockManager,
         mvcc::tests::*,
-        txn::{
-            commands::{WriteCommand, WriteContext},
-            scheduler::DEFAULT_EXECUTION_DURATION_LIMIT,
-            tests::*,
-            txn_status_cache::TxnStatusCache,
-        },
+        txn::{commands::WriteContext, tests::*, txn_status_cache::TxnStatusCache},
         TestEngineBuilder,
     };
 
@@ -133,13 +143,15 @@ pub mod tests {
         let for_update_ts = for_update_ts.into();
         let cm = ConcurrencyManager::new(for_update_ts);
         let start_ts = start_ts.into();
-        let command = crate::storage::txn::commands::PessimisticRollback {
-            ctx: ctx.clone(),
-            keys: vec![Key::from_raw(key)],
+
+        let command = crate::storage::txn::commands::PessimisticRollback::new(
+            vec![Key::from_raw(key)],
             start_ts,
             for_update_ts,
-            deadline: Deadline::from_now(DEFAULT_EXECUTION_DURATION_LIMIT),
-        };
+            None,
+            ctx.clone(),
+        )
+        .cmd;
         let lock_mgr = MockLockManager::new();
         let write_context = WriteContext {
             lock_mgr: &lock_mgr,

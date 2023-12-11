@@ -1700,7 +1700,13 @@ fn test_resolve_lock_deadline() {
     txn_status.insert(TimeStamp::new(10), TimeStamp::new(0));
     storage
         .sched_txn_command(
-            commands::ResolveLockReadPhase::new(txn_status, None, ctx),
+            commands::ResolveLockReadPhase::new(
+                txn_status,
+                None,
+                ctx,
+                TimeStamp::default(),
+                TimeStamp::default(),
+            ),
             Box::new(move |res: storage::Result<_>| {
                 tx.send(res).unwrap();
             }),

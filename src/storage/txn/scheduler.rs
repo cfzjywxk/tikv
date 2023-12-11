@@ -2068,7 +2068,15 @@ mod tests {
         let mut temp_map = HashMap::default();
         temp_map.insert(10.into(), 20.into());
         let readonly_cmds: Vec<Command> = vec![
-            commands::ResolveLockReadPhase::new(temp_map.clone(), None, Context::default()).into(),
+            commands::ResolveLockReadPhase::new(
+                temp_map.clone(),
+                None,
+                CommandKind::resolve_lock,
+                TimeStamp::default(),
+                TimeStamp::default(),
+                Context::default(),
+            )
+            .into(),
             commands::MvccByKey::new(Key::from_raw(b"k"), Context::default()).into(),
             commands::MvccByStartTs::new(25.into(), Context::default()).into(),
         ];
@@ -2115,6 +2123,7 @@ mod tests {
                 vec![Key::from_raw(b"k")],
                 10.into(),
                 20.into(),
+                None,
                 Context::default(),
             )
             .into(),

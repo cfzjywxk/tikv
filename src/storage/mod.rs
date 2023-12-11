@@ -3715,18 +3715,50 @@ pub mod test_util {
         start_ts: u64,
         for_update_ts: u64,
     ) {
+        delete_pessimistic_lock_impl(storage, Some(key), start_ts, for_update_ts)
+    }
+
+    pub fn delete_pessimistic_lock_with_scan_first<E: Engine, L: LockManager, F: KvFormat>(
+        storage: &Storage<E, L, F>,
+        start_ts: u64,
+        for_update_ts: u64,
+    ) {
+        delete_pessimistic_lock_impl(storage, None, start_ts, for_update_ts)
+    }
+
+    fn delete_pessimistic_lock_impl<E: Engine, L: LockManager, F: KvFormat>(
+        storage: &Storage<E, L, F>,
+        key: Option<Key>,
+        start_ts: u64,
+        for_update_ts: u64,
+    ) {
         let (tx, rx) = channel();
-        storage
-            .sched_txn_command(
-                commands::PessimisticRollback::new(
-                    vec![key],
-                    start_ts.into(),
-                    for_update_ts.into(),
-                    Context::default(),
-                ),
-                expect_ok_callback(tx, 0),
-            )
-            .unwrap();
+        if let Some(key) = key {
+            storage
+                .sched_txn_command(
+                    commands::PessimisticRollback::new(
+                        vec![key],
+                        start_ts.into(),
+                        for_update_ts.into(),
+                        None,
+                        Context::default(),
+                    ),
+                    expect_ok_callback(tx, 0),
+                )
+                .unwrap();
+        } else {
+            storage
+                .sched_txn_command(
+                    commands::ResolveLockReadPhase::new_for_pessimistic_rollback(
+                        start_ts.into(),
+                        for_update_ts.into(),
+                        None,
+                        Context::default(),
+                    ),
+                    expect_ok_callback(tx, 0),
+                )
+                .unwrap();
+        };
         rx.recv().unwrap();
     }
 
@@ -7793,7 +7825,14 @@ mod tests {
                 );
                 storage
                     .sched_txn_command(
-                        commands::ResolveLockReadPhase::new(txn_status, None, Context::default()),
+                        commands::ResolveLockReadPhase::new(
+                            txn_status,
+                            None,
+                            CommandKind::resolve_lock,
+                            TimeStamp::default(),
+                            TimeStamp::default(),
+                            Context::default(),
+                        ),
                         expect_ok_callback(tx.clone(), 0),
                     )
                     .unwrap();
@@ -9450,6 +9489,7 @@ mod tests {
                     keys.clone(),
                     50.into(),
                     50.into(),
+                    None,
                     Context::default(),
                 ),
                 expect_ok_callback(tx.clone(), 0),
@@ -9502,7 +9542,14 @@ mod tests {
         let h_committed = lock_blocked(&committed_keys, 76, 75, 76);
         storage
             .sched_txn_command(
-                commands::ResolveLockReadPhase::new(txn_status, None, Context::default()),
+                commands::ResolveLockReadPhase::new(
+                    txn_status,
+                    None,
+                    CommandKind::resolve_lock,
+                    TimeStamp::default(),
+                    TimeStamp::default(),
+                    Context::default(),
+                ),
                 expect_ok_callback(tx.clone(), 0),
             )
             .unwrap();
@@ -11180,6 +11227,9 @@ mod tests {
                         .into_iter()
                         .collect(),
                     None,
+                    CommandKind::resolve_lock,
+                    TimeStamp::default(),
+                    TimeStamp::default(),
                     Context::default(),
                 ),
                 expect_ok_callback(tx.clone(), 0),
@@ -11419,5 +11469,34 @@ mod tests {
                 .unwrap(),
             140.into()
         );
+    }
+
+    #[test]
+    fn test_pessimistic_rollback_with_scan_first() {
+        use crate::storage::txn::tests::must_pessimistic_locked;
+        let storage = TestStorageBuilderApiV1::new(MockLockManager::new())
+            .build()
+            .unwrap();
+        let (tx, rx) = channel();
+
+        // Basic case, pessimistic lock a key using scan first and then roll back it.
+        let k1 = b"k1";
+        let start_ts = 10;
+        let for_update_ts = 10;
+        storage
+            .sched_txn_command(
+                new_acquire_pessimistic_lock_command(
+                    vec![(Key::from_raw(k1), false)],
+                    start_ts,
+                    for_update_ts,
+                    false,
+                    false,
+                ),
+                expect_ok_callback(tx, 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        //must_pessimistic_locked(&mut storage.engine, k1, start_ts, for_update_ts);
+        delete_pessimistic_lock(&storage, Key::from_raw(k1), start_ts, for_update_ts);
     }
 }

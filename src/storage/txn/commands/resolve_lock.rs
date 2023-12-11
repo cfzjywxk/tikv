@@ -7,6 +7,7 @@ use txn_types::{Key, Lock, TimeStamp};
 use crate::storage::{
     kv::WriteData,
     lock_manager::LockManager,
+    metrics,
     mvcc::{
         Error as MvccError, ErrorInner as MvccErrorInner, MvccTxn, SnapshotReader,
         MAX_TXN_WRITE_SIZE,
@@ -135,14 +136,16 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for ResolveLock {
         let pr = if scan_key.is_none() {
             ProcessResult::Res
         } else {
-            let next_cmd = ResolveLockReadPhase {
-                ctx: ctx.clone(),
-                deadline: self.deadline,
-                txn_status,
-                scan_key,
-            };
             ProcessResult::NextCommand {
-                cmd: Command::ResolveLockReadPhase(next_cmd),
+                cmd: ResolveLockReadPhase::new(
+                    txn_status,
+                    scan_key,
+                    metrics::CommandKind::resolve_lock,
+                    TimeStamp::default(),
+                    TimeStamp::default(),
+                    ctx.clone(),
+                )
+                .cmd,
             }
         };
         let new_acquired_locks = txn.take_new_locks();

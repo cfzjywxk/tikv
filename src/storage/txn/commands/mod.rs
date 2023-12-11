@@ -274,14 +274,23 @@ impl From<BatchRollbackRequest> for TypedCommand<()> {
 
 impl From<PessimisticRollbackRequest> for TypedCommand<Vec<StorageResult<()>>> {
     fn from(mut req: PessimisticRollbackRequest) -> Self {
-        let keys = req.get_keys().iter().map(|x| Key::from_raw(x)).collect();
-
-        PessimisticRollback::new(
-            keys,
-            req.get_start_version().into(),
-            req.get_for_update_ts().into(),
-            req.take_context(),
-        )
+        if req.get_keys().is_empty() {
+            ResolveLockReadPhase::new_for_pessimistic_rollback(
+                req.get_start_version().into(),
+                req.get_for_update_ts().into(),
+                None,
+                req.take_context(),
+            )
+        } else {
+            let keys = req.get_keys().iter().map(|x| Key::from_raw(x)).collect();
+            PessimisticRollback::new(
+                keys,
+                req.get_start_version().into(),
+                req.get_for_update_ts().into(),
+                None,
+                req.take_context(),
+            )
+        }
     }
 }
 
@@ -346,7 +355,14 @@ impl From<ResolveLockRequest> for TypedCommand<()> {
         };
 
         if resolve_keys.is_empty() {
-            ResolveLockReadPhase::new(txn_status, None, req.take_context())
+            ResolveLockReadPhase::new(
+                txn_status,
+                None,
+                metrics::CommandKind::resolve_lock,
+                TimeStamp::default(),
+                TimeStamp::default(),
+                req.take_context(),
+            )
         } else {
             let start_ts: TimeStamp = req.get_start_version().into();
             assert!(!start_ts.is_zero());
