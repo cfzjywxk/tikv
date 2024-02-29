@@ -72,6 +72,7 @@ const GRPC_MSG_NOTIFY_SIZE: usize = 8;
 
 /// Service handles the RPC messages for the `Tikv` service.
 pub struct Service<E: Engine, L: LockManager, F: KvFormat> {
+    cluster_id: u64,
     store_id: u64,
     /// Used to handle requests related to GC.
     // TODO: make it Some after GC is supported for v2.
@@ -112,6 +113,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Drop for Service<E, L, F> {
 impl<E: Engine + Clone, L: LockManager + Clone, F: KvFormat> Clone for Service<E, L, F> {
     fn clone(&self) -> Self {
         Service {
+            cluster_id: self.cluster_id,
             store_id: self.store_id,
             gc_worker: self.gc_worker.clone(),
             storage: self.storage.clone(),
@@ -134,6 +136,7 @@ impl<E: Engine + Clone, L: LockManager + Clone, F: KvFormat> Clone for Service<E
 impl<E: Engine, L: LockManager, F: KvFormat> Service<E, L, F> {
     /// Constructs a new `Service` which provides the `Tikv` service.
     pub fn new(
+        cluster_id: u64,
         store_id: u64,
         storage: Storage<E, L, F>,
         gc_worker: GcWorker<E>,
@@ -154,6 +157,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Service<E, L, F> {
             .unwrap()
             .as_millis() as u64;
         Service {
+            cluster_id,
             store_id,
             gc_worker,
             storage,
@@ -217,6 +221,14 @@ macro_rules! handle_request {
     };
     ($fn_name: ident, $future_name: ident, $req_ty: ident, $resp_ty: ident, $time_detail: tt) => {
         fn $fn_name(&mut self, ctx: RpcContext<'_>, req: $req_ty, sink: UnarySink<$resp_ty>) {
+            let cluster_id = req.get_context().get_cluster_id();
+            if cluster_id > 0 && cluster_id != self.cluster_id {
+                // Reject the request if the cluster IDs do not match.
+                warn!("unexpected request with different cluster id is received"; "req" => ?&req);
+                let e = RpcStatus::new(RpcStatusCode::INVALID_ARGUMENT);
+                ctx.spawn(sink.fail(e).unwrap_or_else(|_|{}),);
+                return;
+            }
             forward_unary!(self.proxy, $fn_name, ctx, req, sink);
             let begin_instant = Instant::now();
 
@@ -959,6 +971,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         let pool_size = storage.get_normal_pool_size();
         let batch_builder = BatcherBuilder::new(self.enable_req_batch, pool_size);
         let resource_manager = self.resource_manager.clone();
+        let cluster_id = self.cluster_id;
         let mut health_feedback_attacher = HealthFeedbackAttacher::new(
             self.store_id,
             self.health_controller.clone(),
@@ -973,6 +986,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
             GRPC_REQ_BATCH_COMMANDS_SIZE.observe(requests.len() as f64);
             for (id, req) in request_ids.into_iter().zip(requests) {
                 handle_batch_commands_request(
+                    cluster_id,
                     &mut batcher,
                     &storage,
                     &copr,
@@ -1191,6 +1205,7 @@ fn response_batch_commands_request<F, T>(
 }
 
 fn handle_batch_commands_request<E: Engine, L: LockManager, F: KvFormat>(
+    cluster_id: u64,
     batcher: &mut Option<ReqBatcher>,
     storage: &Storage<E, L, F>,
     copr: &Endpoint<E>,
@@ -1221,6 +1236,14 @@ fn handle_batch_commands_request<E: Engine, L: LockManager, F: KvFormat>(
                     response_batch_commands_request(id, resp, tx.clone(), begin_instant, GrpcTypeKind::invalid, String::default(), ResourcePriority::unknown);
                 },
                 Some(batch_commands_request::request::Cmd::Get(req)) => {
+                    let req_cluster_id = req.get_context().get_cluster_id();
+                    if req_cluster_id > 0 && req_cluster_id != cluster_id {
+                        let resp = future::ok(batch_commands_response::Response::default());
+                        let begin_instant = Instant::now();
+                        response_batch_commands_request(id, resp, tx.clone(), begin_instant, GrpcTypeKind::invalid, String::default(), ResourcePriority::unknown);
+                        warn!("skip unexpected request in batch command with different cluster id"; "req" => ?&req);
+                        return;
+                    }
                     let resource_control_ctx = req.get_context().get_resource_control_context();
                     let mut resource_group_priority = ResourcePriority::unknown;
                     if let Some(resource_manager) = resource_manager {

@@ -3350,3 +3350,123 @@ fn test_pipelined_dml_buffer_get_other_key() {
     assert!(!resp.has_region_error());
     assert!(resp.get_pairs().is_empty());
 }
+
+// #[test_case(test_raftstore::must_new_cluster_and_kv_client)]
+// #[test_case(test_raftstore_v2::must_new_cluster_and_kv_client)]
+#[test]
+fn test_check_cluster_id() {
+    let (mut cluster, client, ctx) = must_new_cluster_and_kv_client();
+    let k1 = b"k1";
+    let v1 = b"v1";
+    let mut ts = 1;
+    // Prewrite
+    let mut mutation = Mutation::default();
+    mutation.set_op(Op::Put);
+    mutation.set_key(k1.to_vec());
+    mutation.set_value(v1.to_vec());
+    must_kv_prewrite(
+        &client,
+        ctx.clone(),
+        vec![mutation],
+        k1.to_vec(),
+        ts,
+    );
+
+    // Commit
+    must_kv_commit(
+        &client,
+        ctx.clone(),
+        vec![k1.to_vec()],
+        ts,
+        ts + 1,
+        ts + 1,
+    );
+
+    // Test unary requests, cluster id is not set.
+    let mut get_req = GetRequest::default();
+    get_req.set_context(ctx.clone());
+    get_req.key = k1.to_vec();
+    get_req.version = 10;
+    let get_resp = client.kv_get(&get_req).unwrap();
+    assert!(!get_resp.has_region_error());
+    assert!(
+        !get_resp.has_error(),
+        "get error {:?}",
+        get_resp.get_error()
+    );
+    assert_eq!(get_resp.get_value(), v1);
+
+    // Test unary request, cluster id is set correctly.
+    get_req.mut_context().cluster_id = ctx.cluster_id;
+    let get_resp = client.kv_get(&get_req).unwrap();
+    assert!(!get_resp.has_region_error());
+    assert!(
+        !get_resp.has_error(),
+        "get error {:?}",
+        get_resp.get_error()
+    );
+    assert_eq!(get_resp.get_value(), v1);
+
+    // Test unary request, cluster id is set incorrectly.
+    get_req.mut_context().cluster_id = ctx.cluster_id + 1;
+    let get_resp = client.kv_get(&get_req);
+    let mut error_match = false;
+    if let Error::RpcFailure(status) = get_resp.unwrap_err() {
+        if status.code() == RpcStatusCode::INVALID_ARGUMENT {
+            error_match = true;
+        }
+    }
+    assert!(error_match);
+
+    // TODO: remove.
+    get_req.mut_context().cluster_id = ctx.cluster_id;
+    let get_resp = client.kv_get(&get_req).unwrap();
+    assert!(!get_resp.has_region_error());
+    assert!(
+        !get_resp.has_error(),
+        "get error {:?}",
+        get_resp.get_error()
+    );
+    assert_eq!(get_resp.get_value(), v1);
+
+    // assert!(get_resp.err().unwrap().to_string().contains("INVALIDD"));
+
+    // Test batch command requests.
+    // for set_cluster_id in [false, true] {
+    //     for invalid_req_index in [0, 5, 9] {
+    //         let (mut sender, receiver) = client.batch_commands().unwrap();
+    //         let mut batch_req = BatchCommandsRequest::default();
+    //         for i in 0..10 {
+    //             let mut get = GetRequest::default();
+    //             get.set_context(ctx.clone());
+    //             if set_cluster_id {
+    //                 get.mut_context().cluster_id == ctx.cluster_id;
+    //             }
+    //             if i == invalid_req_index {
+    //                 get.mut_context().cluster_id = ctx.cluster_id + 100;
+    //             }
+    //             let mut req = batch_commands_request::Request::default();
+    //             req.cmd = Some(batch_commands_request::request::Cmd::Get(get));
+    //
+    //             batch_req.mut_requests().push(req);
+    //             batch_req.mut_request_ids().push(i);
+    //         }
+    //         block_on(sender.send((batch_req, WriteFlags::default()))).unwrap();
+    //         block_on(sender.close()).unwrap();
+    //
+    //         let resps = block_on(
+    //             receiver
+    //                 .map(move |b| futures::stream::iter(b.unwrap().take_responses().into_vec()))
+    //                 .flatten()
+    //                 .collect::<Vec<_>>(),
+    //         );
+    //         for (idx, resp) in resps.iter().enumerate() {
+    //             if idx == invalid_req_index {
+    //                 assert!(resp.cmd.is_none());
+    //             } else {
+    //                 assert!(resp.cmd.is_some());
+    //             }
+    //         }
+    //     }
+    // }
+}
