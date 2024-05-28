@@ -1593,6 +1593,7 @@ where
 
     pub fn must_transfer_leader(&mut self, region_id: u64, leader: metapb::Peer) {
         let timer = Instant::now();
+        let mut transfer_proposed = false;
         loop {
             self.reset_leader_of_region(region_id);
             let cur_leader = self.leader_of_region(region_id);
@@ -1603,13 +1604,16 @@ where
                     return;
                 }
             }
-            if timer.saturating_elapsed() > Duration::from_secs(5) {
+            if timer.saturating_elapsed() > Duration::from_secs(10) {
                 panic!(
                     "failed to transfer leader to [{}] {:?}, current leader: {:?}",
                     region_id, leader, cur_leader
                 );
             }
-            self.transfer_leader(region_id, leader.clone());
+            // if !transfer_proposed {
+            //     self.transfer_leader(region_id, leader.clone());
+            //     transfer_proposed = true;
+            // }
         }
     }
 

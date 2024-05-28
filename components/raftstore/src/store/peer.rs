@@ -3718,6 +3718,7 @@ where
         let is_urgent = is_request_urgent(&req);
 
         let policy = self.inspect(&req);
+        info!("[for debug] propose on self={:?} req={:?} policy={:?}", self.peer, &req, &policy);
         let res = match policy {
             Ok(RequestPolicy::ReadLocal) | Ok(RequestPolicy::StaleRead) => {
                 self.read_local(ctx, req, cb);
@@ -3861,6 +3862,7 @@ where
         msg.set_msg_type(eraftpb::MessageType::MsgTransferLeader);
         msg.set_from(self.peer_id());
         msg.set_index(self.get_store().entry_cache_first_index().unwrap_or(0));
+        info!("[for debug] pre_transfer_leader, send msg={:?} to the target={:?}", &msg, peer);
         // log term here represents the term of last log. For leader, the term of last
         // log is always its current term. Not just set term because raft library
         // forbids setting it for MsgTransferLeader messages.
@@ -4662,6 +4664,7 @@ where
             }
         }
 
+        info!("[for debug] pre_ack_transfer_leader_msg should_ack_now={:?} no more warm up", should_ack_now);
         if should_ack_now {
             return true;
         }
@@ -4725,6 +4728,7 @@ where
         req: RaftCmdRequest,
         cb: Callback<EK::Snapshot>,
     ) -> bool {
+        info!("[for debug] >>>propose_transfer_leader, self={:?}", self.peer);
         let transfer_leader = get_transfer_leader_cmd(&req).unwrap();
         if let Err(err) = ctx
             .coprocessor_host
