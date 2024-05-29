@@ -642,6 +642,9 @@ where
             batch_max_level,
             mut cb_batch,
         } = mem::replace(&mut self.applied_batch, ApplyCallbackBatch::new());
+        if self.store_id == 1 {
+            info!("[for debug] on store_id=1 cmd_batch={:?}", &cmd_batch);
+        }
         // Call it before invoking callback for preventing Commit is executed before
         // Prewrite is observed.
         self.host
@@ -1396,7 +1399,8 @@ where
         apply_ctx.sync_log_hint |= should_sync_log(&req);
 
         apply_ctx.host.pre_apply(&self.region, &req);
-        let (mut cmd, exec_result, should_write) = self.apply_raft_cmd(apply_ctx, index, term, req);
+        let (mut cmd, exec_result, should_write) =
+            self.apply_raft_cmd(apply_ctx, index, term, req.clone());
         if let ApplyResult::WaitMergeSource(_) = exec_result {
             return exec_result;
         }
@@ -1405,7 +1409,8 @@ where
             "applied command";
             "region_id" => self.region_id(),
             "peer_id" => self.id(),
-            "index" => index
+            "index" => index,
+            "req" => ?&req,
         );
 
         // TODO: if we have exec_result, maybe we should return this callback too. Outer
@@ -1761,6 +1766,9 @@ where
                 unimplemented!();
             }
         );
+        if self.id() == 1 {
+            info!("[for debug] apply exec_write_cmd={:?} on peer={:?}", req, self.peer);
+        }
 
         let requests = req.get_requests();
 
@@ -4687,8 +4695,8 @@ where
             HandleResult::KeepProcessing
         });
         fail_point!(
-            "before_handle_normal_1003",
-            normal.delegate.id() == 1003,
+            "before_handle_normal_1",
+            normal.delegate.id() == 1,
             |_| { HandleResult::KeepProcessing }
         );
         while self.msg_buf.len() < self.messages_per_tick {

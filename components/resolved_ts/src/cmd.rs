@@ -62,6 +62,7 @@ impl ChangeLog {
                             WriteBatchFlags::from_bits_truncate(request.get_header().get_flags());
                         let is_one_pc = flags.contains(WriteBatchFlags::ONE_PC);
                         let (changes, has_ingest_sst) = group_row_changes(request.requests.into());
+                        info!("[for debug] encode_change_log, changes={:?}", &changes);
                         let mut rows = Self::encode_rows(changes, is_one_pc);
                         if has_ingest_sst {
                             rows.push(ChangeRow::IngestSsT);

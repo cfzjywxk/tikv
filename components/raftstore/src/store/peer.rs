@@ -2969,6 +2969,11 @@ where
         ctx: &mut PollContext<EK, ER, T>,
         committed_entries: Vec<Entry>,
     ) {
+        if self.peer.get_id() == 1 {
+            for entry in committed_entries.iter() {
+                info!("[for debug] peer 1 schedule committed entry index={:?}", entry.index);
+            }
+        }
         if committed_entries.is_empty() {
             return;
         }
@@ -3517,6 +3522,10 @@ where
                 while let Some(mut read) = self.pending_reads.pop_front() {
                     self.response_read(&mut read, ctx, false);
                 }
+            } else {
+                info!("[for debug] self={:?} is still not ready to handle reads, store_applied_term={:?}, self.term={:?}",
+                    &self.peer, self.get_store().applied_term(), self.term()
+                );
             }
         }
 
@@ -3718,6 +3727,10 @@ where
         let is_urgent = is_request_urgent(&req);
 
         let policy = self.inspect(&req);
+        info!(
+            "[for debug] propose on self={:?} req={:?} policy={:?}",
+            self.peer, &req, &policy
+        );
         let res = match policy {
             Ok(RequestPolicy::ReadLocal) | Ok(RequestPolicy::StaleRead) => {
                 self.read_local(ctx, req, cb);
@@ -3861,6 +3874,10 @@ where
         msg.set_msg_type(eraftpb::MessageType::MsgTransferLeader);
         msg.set_from(self.peer_id());
         msg.set_index(self.get_store().entry_cache_first_index().unwrap_or(0));
+        info!(
+            "[for debug] pre_transfer_leader, send msg={:?} to the target={:?}",
+            &msg, peer
+        );
         // log term here represents the term of last log. For leader, the term of last
         // log is always its current term. Not just set term because raft library
         // forbids setting it for MsgTransferLeader messages.
@@ -4662,6 +4679,10 @@ where
             }
         }
 
+        info!(
+            "[for debug] pre_ack_transfer_leader_msg should_ack_now={:?} no more warm up",
+            should_ack_now
+        );
         if should_ack_now {
             return true;
         }
@@ -4725,6 +4746,10 @@ where
         req: RaftCmdRequest,
         cb: Callback<EK::Snapshot>,
     ) -> bool {
+        info!(
+            "[for debug] >>>propose_transfer_leader, self={:?}",
+            self.peer
+        );
         let transfer_leader = get_transfer_leader_cmd(&req).unwrap();
         if let Err(err) = ctx
             .coprocessor_host

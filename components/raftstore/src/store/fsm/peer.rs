@@ -51,6 +51,7 @@ use raft::{
     eraftpb::{self, ConfChangeType, MessageType},
     GetEntriesContext, Progress, ReadState, SnapshotStatus, StateRole, INVALID_INDEX, NO_LIMIT,
 };
+use raft_proto::eraftpb::MessageType::MsgTransferLeader;
 use smallvec::SmallVec;
 use strum::{EnumCount, VariantNames};
 use tikv_alloc::trace::TraceEvent;
@@ -2335,6 +2336,14 @@ where
             "peer_id" => self.fsm.peer_id(),
             "election_elapsed" => self.fsm.peer.raft_group.raft.election_elapsed);
         self.fsm.reset_hibernate_state(GroupState::Idle);
+
+        fail_point!(
+            "on_raft_base_tick_fp",
+            cfg!(release) || self.fsm.get_peer().peer.get_id() == 2,
+            |_| {
+                unimplemented!();
+            }
+        );
         // Followers will stop ticking at L789. Keep ticking for followers
         // to allow it to campaign quickly when abnormal situation is detected.
         if !self.fsm.peer.is_leader() {
@@ -2618,6 +2627,15 @@ where
             "to_peer_id" => msg.get_to_peer().get_id(),
             "is_initialized_peer" => is_initialized_peer,
         );
+
+        let msg_type = msg.get_message().get_msg_type();
+        if msg_type == MsgTransferLeader {
+            info!(
+                "[for debug] on_raft_message transfer leader msg={:?} self={:?}",
+                &msg,
+                self.fsm.get_peer().peer
+            );
+        }
 
         if self.fsm.peer.pending_remove || self.fsm.stopped {
             return Ok(());
@@ -3556,6 +3574,10 @@ where
             return;
         }
         if self.fsm.peer.is_leader() {
+            info!(
+                "[for debug] on_transfer_leader_msg on leader self={:?}",
+                self.fsm.get_peer().peer
+            );
             let from = match self.fsm.peer.get_peer_from_cache(msg.get_from()) {
                 Some(p) => p,
                 None => return,
@@ -3567,7 +3589,7 @@ where
             {
                 Some(reason) => {
                     info!(
-                        "reject to transfer leader";
+                        "[for debug]reject to transfer leader";
                         "region_id" => self.fsm.region_id(),
                         "peer_id" => self.fsm.peer_id(),
                         "to" => ?from,
@@ -3577,15 +3599,24 @@ where
                     );
                 }
                 None => {
+                    info!(
+                        "[for debug] >>>propose_pending_batch_raft_command self={:?}",
+                        self.peer()
+                    );
                     self.propose_pending_batch_raft_command();
+                    info!(
+                        "[for debug] <<<propose_pending_batch_raft_command self={:?}",
+                        self.peer()
+                    );
                     if self.propose_locks_before_transfer_leader(msg) {
                         // If some pessimistic locks are just proposed, we propose another
                         // TransferLeader command instead of transferring leader immediately.
-                        info!("propose transfer leader command";
+                        info!("[for debug]propose transfer leader command after propose locks";
                             "region_id" => self.fsm.region_id(),
                             "peer_id" => self.fsm.peer_id(),
                             "to" => ?from,
                         );
+                        fail_point!("after_propose_locks");
                         let mut cmd = new_admin_request(
                             self.fsm.peer.region().get_id(),
                             self.fsm.peer.peer.clone(),
@@ -3604,6 +3635,11 @@ where
                             DiskFullOpt::AllowedOnAlmostFull,
                         );
                     } else {
+                        info!("[for debug]do transfer leader";
+                            "region_id" => self.fsm.region_id(),
+                            "peer_id" => self.fsm.peer_id(),
+                            "to" => ?from,
+                        );
                         self.fsm.peer.transfer_leader(&from);
                     }
                 }
@@ -3614,6 +3650,10 @@ where
             .maybe_reject_transfer_leader_msg(self.ctx, msg, peer_disk_usage)
             && self.fsm.peer.pre_ack_transfer_leader_msg(self.ctx, msg)
         {
+            info!(
+                "[for debug] ack_transfer_leader_msg, self={:?}",
+                self.fsm.get_peer().peer
+            );
             self.fsm.peer.ack_transfer_leader_msg(false);
         }
     }
@@ -3696,7 +3736,7 @@ where
         cmd.mut_header()
             .set_region_epoch(self.region().get_region_epoch().clone());
         cmd.mut_header().set_peer(self.fsm.peer.peer.clone());
-        info!("propose {} locks before transferring leader", cmd.get_requests().len(); "region_id" => self.fsm.region_id());
+        info!("[for debug]propose {} locks before transferring leader", cmd.get_requests().len(); "region_id" => self.fsm.region_id());
         self.propose_raft_command(cmd, Callback::None, DiskFullOpt::AllowedOnAlmostFull);
         true
     }

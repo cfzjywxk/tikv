@@ -30,10 +30,8 @@ use storage::{
     },
     txn::{self, commands},
 };
-use test_raftstore::{
-    configure_for_lease_read, new_learner_peer, new_server_cluster, try_kv_prewrite,
-    DropMessageFilter,
-};
+use test_raftstore::{configure_for_lease_read, new_learner_peer, new_server_cluster, try_kv_prewrite, Direction, DropMessageFilter, IsolationFilterFactory, RegionPacketFilter, CloneFilterFactory};
+use test_util::init_log_for_test;
 use tikv::{
     server::gc_worker::gc_by_compact,
     storage::{
@@ -901,4 +899,157 @@ fn test_forbid_forward_propose() {
 
     std::thread::sleep(Duration::from_secs(1));
     assert_eq!(cluster.get(k.as_encoded()), None);
+}
+
+#[test]
+fn test_propose_pessimistic_lock_with_prewrite_lock() {
+    init_log_for_test();
+    let mut cluster = new_server_cluster(0, 3);
+    configure_for_lease_read(&mut cluster.cfg, Some(10), Some(1000));
+    cluster.cfg.storage.enable_async_apply_prewrite = true;
+    cluster.cfg.pessimistic_txn.pipelined = true;
+    cluster.cfg.pessimistic_txn.in_memory = true;
+    cluster.cfg.raft_store.max_entry_cache_warmup_duration = ReadableDuration::ZERO;
+    cluster.cfg.raft_store.hibernate_regions = false;
+    cluster.cfg.resolved_ts.enable = true;
+    cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::hours(1);
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+
+    let k0 = b"k0";
+    let v0 = b"v0";
+    let r1 = cluster.run_conf_change();
+    let p1 = new_peer(1, 1);
+    let p2 = new_peer(2, 2);
+    cluster.pd_client.must_add_peer(r1, p2.clone());
+    let p3 = new_peer(3, 3);
+    cluster.pd_client.must_add_peer(r1, p3.clone());
+    cluster.must_put(k0, v0);
+    cluster.pd_client.must_none_pending_peer(p2.clone());
+    cluster.pd_client.must_none_pending_peer(p3.clone());
+
+    let region = cluster.get_region(k0);
+    cluster.must_transfer_leader(region.get_id(), p1.clone());
+
+    // // Isolate P2 from leader P1.
+    // cluster.add_send_filter_on_node(
+    //     p2.get_store_id(),
+    //     Box::new(
+    //         RegionPacketFilter::new(region.get_id(), p2.get_store_id()).direction(Direction::Recv),
+    //     ),
+    // );
+
+    // Propose pessimistic locks on the leader P1.
+    let mut ctx_p1 = Context::default();
+    let start_ts = 10;
+    ctx_p1.set_region_id(region.get_id());
+    ctx_p1.set_region_epoch(region.get_region_epoch().clone());
+    ctx_p1.set_peer(p1.clone());
+
+    let mut mutation = pb::Mutation::default();
+    mutation.set_op(Op::PessimisticLock);
+    mutation.key = k0.to_vec();
+    let mut req = PessimisticLockRequest::default();
+    req.set_context(ctx_p1.clone());
+    req.set_mutations(vec![mutation].into());
+    req.set_start_version(start_ts);
+    req.set_for_update_ts(start_ts);
+    req.set_primary_lock(k0.to_vec());
+
+    let env = Arc::new(Environment::new(1));
+    let channel =
+        ChannelBuilder::new(env.clone()).connect(&cluster.sim.rl().get_addr(p1.get_store_id()));
+    let client_p1 = TikvClient::new(channel);
+    let resp = client_p1.kv_pessimistic_lock(&req).unwrap();
+    assert_eq!(resp.get_errors().len(), 0);
+    assert!(!resp.has_region_error());
+
+    // Verify the in memory lock exists on the leader peer.
+    let txn_ext = cluster
+        .must_get_snapshot_of_region(region.get_id())
+        .ext()
+        .get_txn_ext()
+        .unwrap()
+        .clone();
+    {
+        let read_guard = txn_ext.pessimistic_locks.read();
+        let res = read_guard.get(&Key::from_raw(k0)).unwrap();
+        assert_eq!(res.0.start_ts, start_ts.into());
+        assert_eq!(res.0.primary, (*k0).into());
+    }
+
+    // Pause apply on peer 3, transfer leader to peer 3.
+    // fail::cfg("on_apply_write_cmd", "pause").unwrap();
+    // fail::cfg("on_raft_base_tick_fp", "sleep(500)").unwrap();
+    // Isolate P1 from other nodes.
+
+    info!("[for debug] >>>>>> start to transfer leader to P3");
+    cluster.add_send_filter(CloneFilterFactory(
+        RegionPacketFilter::new(region.get_id(), p3.get_store_id())
+            .msg_type(MessageType::MsgTimeoutNow)
+            .direction(Direction::Recv),
+    ));
+    fail::cfg("after_propose_locks", "sleep(2000)").unwrap();
+    fail::cfg("before_handle_normal_1", "sleep(3000)").unwrap();
+    cluster.must_transfer_leader_if_possible(region.get_id(), p3.clone());
+
+    // info!("[for debug] >>>>>> start to isolate original leader p1 and let election happens");
+    // cluster.add_send_filter(IsolationFilterFactory::new(p1.get_store_id()));
+    // cluster.clear_send_filter_on_node(p2.get_store_id());
+    // cluster.must_wait_leader(region.get_id(), p3.clone());
+
+
+    // KV Prewrite.
+    info!("[for debug] >>>>>> start to kv prewrite on the P1");
+    let mut mutation = pb::Mutation::default();
+    mutation.set_op(Op::Put);
+    mutation.key = k0.to_vec();
+    mutation.value = v0.to_vec();
+    let mut req = PrewriteRequest::default();
+    // let mut ctx_p3 = Context::default();
+    // ctx_p3.set_region_id(region.get_id());
+    // ctx_p3.set_region_epoch(region.get_region_epoch().clone());
+    // ctx_p3.set_peer(p3.clone());
+    req.set_context(ctx_p1.clone());
+    req.set_pessimistic_actions(vec![DoPessimisticCheck]);
+    req.set_mutations(vec![mutation].into());
+    req.set_start_version(start_ts);
+    req.set_for_update_ts(start_ts);
+    req.set_primary_lock(k0.to_vec());
+    req.set_min_commit_ts(start_ts + 1);
+    req.set_lock_ttl(3000);
+    // let env = Arc::new(Environment::new(1));
+    // let channel = ChannelBuilder::new(env.clone()).connect(&cluster.sim.rl().get_addr(p1.get_store_id()));
+    // let client_p3 = TikvClient::new(channel);
+    let resp = client_p1.kv_prewrite(&req).unwrap();
+    info!("[for debug] prewrite resp={:?}", &resp);
+    assert!(resp.get_errors().len() == 0);
+    assert!(!resp.has_region_error());
+    fail::remove("after_propose_locks");
+    fail::remove("before_handle_normal_1");
+    thread::sleep(Duration::from_millis(3000));
+    info!("[for debug] <<<<<< quit test");
+    cluster.clear_send_filters();
+
+    // let env = Arc::new(Environment::new(1));
+    // let channel =
+    //     ChannelBuilder::new(env.clone()).connect(&cluster.sim.rl().
+    // get_addr(p3.get_store_id())); let client_p3 =
+    // TikvClient::new(channel); fail::cfg("on_apply_write_cmd",
+    // "sleep(2000)").unwrap(); client_p3.kv_prewrite(&req).unwrap();
+    //
+    // // The apply is blocked on leader, so the read index request with max ts
+    // should // see the memory lock as it would be dropped after finishing
+    // apply. let channel =
+    // ChannelBuilder::new(env).connect(&cluster.sim.rl().get_addr(p2.
+    // get_store_id())); let client_p2 = TikvClient::new(channel);
+    // let mut req = GetRequest::new();
+    // req.key = k1.to_vec();
+    // req.version = u64::MAX;
+    // ctx_p2.replica_read = true;
+    // req.set_context(ctx_p2);
+    // let resp = client_p2.kv_get(&req).unwrap();
+    // assert!(resp.region_error.is_none());
+    // assert_eq!(resp.error.unwrap().locked.unwrap().lock_version, start_ts);
+    // fail::remove("on_apply_write_cmd");
 }

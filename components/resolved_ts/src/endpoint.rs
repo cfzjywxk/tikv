@@ -876,6 +876,8 @@ where
             if batch.is_empty() {
                 continue;
             }
+            let observed_region = self.regions.get_mut(&batch.region_id);
+            info!("[for debug] resolved-ts handle_change_log, cmd_batch={:?}, store={:?} observed_region={:?}", &batch, self.store_id, observed_region.is_some());
             if let Some(observe_region) = self.regions.get_mut(&batch.region_id) {
                 let observe_id = batch.rts_id;
                 let region_id = observe_region.meta.id;
@@ -890,7 +892,7 @@ where
                         self.re_register_region(region_id, observe_id, e, backoff);
                     }
                 } else {
-                    debug!("resolved ts CmdBatch discarded";
+                    warn!("[for debug]resolved ts CmdBatch discarded";
                         "region_id" => batch.region_id,
                         "observe_id" => ?batch.rts_id,
                         "current" => ?observe_region.handle.id,

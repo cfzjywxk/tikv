@@ -1591,8 +1591,31 @@ where
         );
     }
 
-    pub fn must_transfer_leader(&mut self, region_id: u64, leader: metapb::Peer) {
+    pub fn must_wait_leader(&mut self, region_id: u64, leader: metapb::Peer) -> bool {
         let timer = Instant::now();
+        loop {
+            self.reset_leader_of_region(region_id);
+            let cur_leader = self.leader_of_region(region_id);
+            if let Some(ref cur_leader) = cur_leader {
+                if cur_leader.get_id() == leader.get_id()
+                    && cur_leader.get_store_id() == leader.get_store_id()
+                {
+                    return true;
+                }
+            }
+            if timer.saturating_elapsed() > Duration::from_secs(10) {
+                error!(
+                    "failed to transfer leader to [{}] {:?}, current leader: {:?}",
+                    region_id, leader, cur_leader
+                );
+                return false
+            }
+        }
+    }
+
+    pub fn must_transfer_leader_if_possible(&mut self, region_id: u64, leader: metapb::Peer) {
+        let timer = Instant::now();
+        let mut transfer_proposed = false;
         loop {
             self.reset_leader_of_region(region_id);
             let cur_leader = self.leader_of_region(region_id);
@@ -1603,13 +1626,43 @@ where
                     return;
                 }
             }
-            if timer.saturating_elapsed() > Duration::from_secs(5) {
+            if timer.saturating_elapsed() > Duration::from_secs(2) {
+                error!(
+                    "failed to transfer leader to [{}] {:?}, current leader: {:?}",
+                    region_id, leader, cur_leader
+                );
+                return;
+            }
+            if !transfer_proposed {
+                self.transfer_leader(region_id, leader.clone());
+                transfer_proposed = true;
+            }
+        }
+    }
+
+    pub fn must_transfer_leader(&mut self, region_id: u64, leader: metapb::Peer) {
+        let timer = Instant::now();
+        let mut transfer_proposed = false;
+        loop {
+            self.reset_leader_of_region(region_id);
+            let cur_leader = self.leader_of_region(region_id);
+            if let Some(ref cur_leader) = cur_leader {
+                if cur_leader.get_id() == leader.get_id()
+                    && cur_leader.get_store_id() == leader.get_store_id()
+                {
+                    return;
+                }
+            }
+            if timer.saturating_elapsed() > Duration::from_secs(10) {
                 panic!(
                     "failed to transfer leader to [{}] {:?}, current leader: {:?}",
                     region_id, leader, cur_leader
                 );
             }
-            self.transfer_leader(region_id, leader.clone());
+            if !transfer_proposed {
+                self.transfer_leader(region_id, leader.clone());
+                transfer_proposed = true;
+            }
         }
     }
 
