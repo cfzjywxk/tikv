@@ -2327,6 +2327,10 @@ where
             }
             res = Some(self.fsm.peer.check_before_tick(&self.ctx.cfg));
             if self.fsm.missing_ticks > 0 {
+                info!(
+                    "[for debug] tick the missing ticks={:?}",
+                    self.fsm.missing_ticks
+                );
                 for _ in 0..self.fsm.missing_ticks {
                     if self.fsm.peer.raft_group.tick() {
                         self.fsm.has_ready = true;
@@ -5597,6 +5601,10 @@ where
             let leader = self.fsm.peer.get_peer_from_cache(leader_id);
             self.fsm.reset_hibernate_state(GroupState::Chaos);
             self.register_raft_base_tick();
+            info!(
+                "[for debug] command={:?} is sent to non-leader peer={:?}",
+                msg, self.fsm.hibernate_state
+            );
             return Err(Error::NotLeader(region_id, leader));
         }
 

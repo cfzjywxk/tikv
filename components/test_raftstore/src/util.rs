@@ -1831,12 +1831,14 @@ pub fn put_with_timeout<EK: KvEngineWithRocks, T: Simulator<EK>>(
 ) -> Result<RaftCmdResponse> {
     let mut region = cluster.get_region(key);
     let region_id = region.get_id();
-    let req = new_request(
+    let mut req = new_request(
         region_id,
         region.take_region_epoch(),
         vec![new_put_cf_cmd(CF_DEFAULT, key, value)],
         false,
     );
+    req.mut_header().mut_peer().id = 1;
+    req.mut_header().mut_peer().store_id = 1;
     cluster.call_command_on_node(node_id, req, timeout)
 }
 
