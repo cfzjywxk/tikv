@@ -10,22 +10,25 @@ use prometheus::{exponential_buckets, local::LocalIntCounter, *};
 use prometheus_static_metric::*;
 use tikv_util::time::Instant;
 
+use crate::storage::ErrorHeaderKind;
 pub use crate::storage::kv::metrics::{
     GcKeysCF, GcKeysCounterVec, GcKeysCounterVecInner, GcKeysDetail,
 };
-use crate::storage::ErrorHeaderKind;
 
 make_auto_flush_static_metric! {
     pub label_enum GrpcTypeKind {
         invalid,
         kv_get,
+        txn_get,
         kv_scan,
+        txn_scan,
         kv_prewrite,
         kv_pessimistic_lock,
         kv_pessimistic_rollback,
         kv_commit,
         kv_cleanup,
         kv_batch_get,
+        txn_batch_get,
         kv_batch_get_command,
         kv_batch_rollback,
         kv_txn_heart_beat,

@@ -279,6 +279,52 @@ macro_rules! handle_request {
     }
 }
 
+macro_rules! handle_request_with_metric {
+    ($fn_name: ident, $future_name: ident, $req_ty: ident, $resp_ty: ident, $metric_name: ident) => {
+        handle_request_with_metric!($fn_name, $future_name, $req_ty, $resp_ty, $metric_name, no_time_detail);
+    };
+    ($fn_name: ident, $future_name: ident, $req_ty: ident, $resp_ty: ident, $metric_name: ident, $time_detail: tt) => {
+        fn $fn_name(&mut self, ctx: RpcContext<'_>, req: $req_ty, sink: UnarySink<$resp_ty>) {
+            reject_if_cluster_id_mismatch!(req, self, ctx, sink);
+            forward_unary!(self.proxy, $fn_name, ctx, req, sink);
+            let begin_instant = Instant::now();
+
+            let source = req.get_context().get_request_source().to_owned();
+            let resource_control_ctx = req.get_context().get_resource_control_context();
+            let mut resource_group_priority = ResourcePriority::unknown;
+            if let Some(resource_manager) = &self.resource_manager {
+                resource_manager.consume_penalty(resource_control_ctx);
+                resource_group_priority = ResourcePriority::from(resource_control_ctx.override_priority);
+            }
+            GRPC_RESOURCE_GROUP_COUNTER_VEC
+                    .with_label_values(&[resource_control_ctx.get_resource_group_name(), resource_control_ctx.get_resource_group_name()])
+                    .inc();
+            let resp = $future_name(&self.storage, req);
+            let task = async move {
+                let resp = resp.await?;
+                let elapsed = begin_instant.saturating_elapsed();
+                set_total_time!(resp, elapsed, $time_detail);
+                sink.success(resp).await?;
+                GRPC_MSG_HISTOGRAM_STATIC
+                    .$metric_name
+                    .get(resource_group_priority)
+                    .observe(elapsed.as_secs_f64());
+                record_request_source_metrics(source, elapsed);
+                ServerResult::Ok(())
+            }
+            .map_err(|e| {
+                log_net_error!(e, "kv rpc failed";
+                    "request" => stringify!($fn_name)
+                );
+                GRPC_MSG_FAIL_COUNTER.$metric_name.inc();
+            })
+            .map(|_|());
+
+            ctx.spawn(task);
+        }
+    }
+}
+
 macro_rules! set_total_time {
     ($resp:ident, $duration:expr,no_time_detail) => {};
     ($resp:ident, $duration:expr,has_time_detail) => {
@@ -297,6 +343,8 @@ macro_rules! set_total_time {
 impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
     handle_request!(kv_get, future_get, GetRequest, GetResponse, has_time_detail);
     handle_request!(kv_scan, future_scan, ScanRequest, ScanResponse);
+    handle_request_with_metric!(txn_get, future_txn_get, TxnGetRequest, TxnGetResponse, kv_get, has_time_detail);
+    handle_request_with_metric!(txn_scan, future_txn_scan, TxnScanRequest, TxnScanResponse, kv_scan);
     handle_request!(
         kv_prewrite,
         future_prewrite,
@@ -331,6 +379,13 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         future_batch_get,
         BatchGetRequest,
         BatchGetResponse
+    );
+    handle_request_with_metric!(
+        txn_batch_get,
+        future_txn_batch_get,
+        TxnBatchGetRequest,
+        TxnBatchGetResponse,
+        kv_batch_get
     );
     handle_request!(
         kv_batch_rollback,
@@ -1609,6 +1664,18 @@ fn future_get<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
+fn future_txn_get<E: Engine, L: LockManager, F: KvFormat>(
+    storage: &Storage<E, L, F>,
+    mut req: TxnGetRequest,
+) -> impl Future<Output = ServerResult<TxnGetResponse>> {
+    let mut legacy_req = GetRequest::default();
+    legacy_req.set_context(req.take_context());
+    legacy_req.set_key(req.take_key());
+    legacy_req.set_version(req.get_version());
+    legacy_req.set_need_commit_ts(req.get_need_commit_ts());
+    future_get(storage, legacy_req).map_ok(convert_get_response)
+}
+
 fn set_time_detail(
     exec_detail_v2: &mut ExecDetailsV2,
     total_dur: Duration,
@@ -1683,6 +1750,22 @@ fn future_scan<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
+fn future_txn_scan<E: Engine, L: LockManager, F: KvFormat>(
+    storage: &Storage<E, L, F>,
+    mut req: TxnScanRequest,
+) -> impl Future<Output = ServerResult<TxnScanResponse>> {
+    let mut legacy_req = ScanRequest::default();
+    legacy_req.set_context(req.take_context());
+    legacy_req.set_start_key(req.take_start_key());
+    legacy_req.set_limit(req.get_limit());
+    legacy_req.set_version(req.get_version());
+    legacy_req.set_key_only(req.get_key_only());
+    legacy_req.set_reverse(req.get_reverse());
+    legacy_req.set_end_key(req.take_end_key());
+    legacy_req.set_sample_step(req.get_sample_step());
+    future_scan(storage, legacy_req).map_ok(convert_scan_response)
+}
+
 fn future_batch_get<E: Engine, L: LockManager, F: KvFormat>(
     storage: &Storage<E, L, F>,
     mut req: BatchGetRequest,
@@ -1739,6 +1822,58 @@ fn future_batch_get<E: Engine, L: LockManager, F: KvFormat>(
         GLOBAL_TRACKERS.remove(tracker);
         Ok(resp)
     }
+}
+
+fn future_txn_batch_get<E: Engine, L: LockManager, F: KvFormat>(
+    storage: &Storage<E, L, F>,
+    mut req: TxnBatchGetRequest,
+) -> impl Future<Output = ServerResult<TxnBatchGetResponse>> {
+    let mut legacy_req = BatchGetRequest::default();
+    legacy_req.set_context(req.take_context());
+    legacy_req.set_keys(req.take_keys());
+    legacy_req.set_version(req.get_version());
+    legacy_req.set_need_commit_ts(req.get_need_commit_ts());
+    future_batch_get(storage, legacy_req).map_ok(convert_batch_get_response)
+}
+
+fn convert_get_response(mut legacy: GetResponse) -> TxnGetResponse {
+    let mut resp = TxnGetResponse::default();
+    if legacy.has_region_error() {
+        resp.set_region_error(legacy.take_region_error());
+    }
+    if legacy.has_error() {
+        resp.set_error(legacy.take_error());
+    }
+    resp.set_value(legacy.take_value());
+    resp.set_not_found(legacy.get_not_found());
+    resp.set_exec_details_v2(legacy.take_exec_details_v2());
+    resp.set_commit_ts(legacy.get_commit_ts());
+    resp
+}
+
+fn convert_scan_response(mut legacy: ScanResponse) -> TxnScanResponse {
+    let mut resp = TxnScanResponse::default();
+    if legacy.has_region_error() {
+        resp.set_region_error(legacy.take_region_error());
+    }
+    if legacy.has_error() {
+        resp.set_error(legacy.take_error());
+    }
+    resp.set_pairs(legacy.take_pairs());
+    resp
+}
+
+fn convert_batch_get_response(mut legacy: BatchGetResponse) -> TxnBatchGetResponse {
+    let mut resp = TxnBatchGetResponse::default();
+    if legacy.has_region_error() {
+        resp.set_region_error(legacy.take_region_error());
+    }
+    if legacy.has_error() {
+        resp.set_error(legacy.take_error());
+    }
+    resp.set_pairs(legacy.take_pairs());
+    resp.set_exec_details_v2(legacy.take_exec_details_v2());
+    resp
 }
 
 fn future_buffer_batch_get<E: Engine, L: LockManager, F: KvFormat>(
@@ -2892,5 +3027,60 @@ mod tests {
                 i
             );
         }
+    }
+
+    #[test]
+    fn test_convert_get_response_to_txn_get_response() {
+        let mut legacy = GetResponse::default();
+        legacy.set_value(b"value".to_vec());
+        legacy.set_not_found(false);
+        legacy.set_commit_ts(123);
+        legacy.mut_exec_details_v2().mut_time_detail_v2().set_total_rpc_wall_time_ns(5);
+
+        let converted = convert_get_response(legacy);
+        assert_eq!(converted.get_value(), b"value");
+        assert_eq!(converted.get_commit_ts(), 123);
+        assert_eq!(
+            converted
+                .get_exec_details_v2()
+                .get_time_detail_v2()
+                .get_total_rpc_wall_time_ns(),
+            5
+        );
+    }
+
+    #[test]
+    fn test_convert_scan_response_to_txn_scan_response() {
+        let mut legacy = ScanResponse::default();
+        let mut pair = KvPair::default();
+        pair.set_key(b"k".to_vec());
+        pair.set_value(b"v".to_vec());
+        legacy.mut_pairs().push(pair);
+
+        let converted = convert_scan_response(legacy);
+        assert_eq!(converted.get_pairs().len(), 1);
+        assert_eq!(converted.get_pairs()[0].get_key(), b"k");
+        assert_eq!(converted.get_pairs()[0].get_value(), b"v");
+    }
+
+    #[test]
+    fn test_convert_batch_get_response_to_txn_batch_get_response() {
+        let mut legacy = BatchGetResponse::default();
+        let mut pair = KvPair::default();
+        pair.set_key(b"k".to_vec());
+        pair.set_value(b"v".to_vec());
+        legacy.mut_pairs().push(pair);
+        legacy.mut_exec_details_v2().mut_time_detail_v2().set_total_rpc_wall_time_ns(7);
+
+        let converted = convert_batch_get_response(legacy);
+        assert_eq!(converted.get_pairs().len(), 1);
+        assert_eq!(converted.get_pairs()[0].get_key(), b"k");
+        assert_eq!(
+            converted
+                .get_exec_details_v2()
+                .get_time_detail_v2()
+                .get_total_rpc_wall_time_ns(),
+            7
+        );
     }
 }
